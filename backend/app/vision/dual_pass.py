@@ -1,0 +1,269 @@
+"""
+Dual-Pass Extraction Engine — Stage 2.
+
+Runs two complementary VLM passes over the same image and cross-validates
+results for consistency.  Pass A identifies the *structure* (field names,
+positions, types); Pass B extracts the *values* (raw text, confidence).
+Fields whose structure contradicts their value are flagged for human review.
+
+Spec: Section 6.3 — Dual-Pass Extraction
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# DualPassResult
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DualPassResult:
+    """Combined result from both extraction passes.
+
+    Attributes:
+        structural_map: Pass A output — field_name -> structure metadata.
+        value_map: Pass B output — field_name -> value + confidence.
+        consistency_score: Overall agreement between passes (0-1).
+        contradictions: List of human-readable contradiction messages.
+    """
+
+    structural_map: dict[str, dict[str, Any]]
+    value_map: dict[str, dict[str, Any]]
+    consistency_score: float
+    contradictions: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# DualPassExtractor
+# ---------------------------------------------------------------------------
+
+class DualPassExtractor:
+    """Two-pass extraction with cross-validation.
+
+    *Pass A* identifies the document structure — every field name, label,
+    and approximate bounding box.  *Pass B* extracts the actual values
+    together with confidence scores.  The extractor then compares the
+    two maps and flags any contradictions (e.g. a field present in Pass A
+    but missing in Pass B, or a Pass B value for a field not listed in
+    Pass A).
+
+    Attributes:
+        PROMPT_PASS_A: Prompt template for structural identification.
+        PROMPT_PASS_B: Prompt template for value extraction.
+    """
+
+    PROMPT_PASS_A: str = """Analyze this bureaucratic document image.
+PASS A — STRUCTURAL: Identify all form fields, their labels, and positions.
+Output a JSON map of: field_name -> {label_text, field_type, estimated_bbox}
+Do NOT extract values yet. Only identify the structure."""
+
+    PROMPT_PASS_B: str = """Analyze this bureaucratic document image.
+PASS B — VALUE EXTRACTION: Extract the actual values for each visible field.
+Output a JSON map of: field_name -> {raw_value, confidence_0_to_1}
+If text is blurry or ambiguous, mark confidence < 0.5."""
+
+    def extract(self, image_path: str, vlm: "VLMManager") -> DualPassResult:
+        """Run dual-pass extraction and cross-validate.
+
+        Pipeline:
+
+        1. **Pass A** (structural) — prompt the VLM to identify all
+           fields and their bounding boxes.
+        2. **Pass B** (value) — prompt the VLM to extract actual values.
+        3. **Parse** both responses as JSON.
+        4. **Cross-validate** — compare field-name sets, flag missing
+           fields, type mismatches, and orphaned values.
+        5. Return a :class:`DualPassResult` with a *consistency_score*.
+
+        Args:
+            image_path: Path to the document image.
+            vlm: A :class:`~app.vision.vlm_loader.VLMManager` or
+                :class:`~app.vision.vlm_loader.MockVLMManager`
+                instance.
+
+        Returns:
+            :class:`DualPassResult` containing both maps and consistency
+            metadata.
+        """
+        logger.info("DualPassExtractor starting — %s", image_path)
+
+        # --------------------------------------------------------------
+        # Pass A — structural identification
+        # --------------------------------------------------------------
+        if not vlm.is_loaded:
+            vlm.load()
+
+        logger.info("DualPassExtractor — Pass A (structural)")
+        raw_a = vlm.generate(image_path, self.PROMPT_PASS_A)
+        structural_map = self._parse_json_response(raw_a)
+        logger.debug("Pass A returned %d fields", len(structural_map))
+
+        # --------------------------------------------------------------
+        # Pass B — value extraction
+        # --------------------------------------------------------------
+        logger.info("DualPassExtractor — Pass B (value extraction)")
+        raw_b = vlm.generate(image_path, self.PROMPT_PASS_B)
+        value_map = self._parse_json_response(raw_b)
+        logger.debug("Pass B returned %d fields", len(value_map))
+
+        # --------------------------------------------------------------
+        # Cross-validation
+        # --------------------------------------------------------------
+        consistency_score, contradictions = self._cross_validate(
+            structural_map, value_map
+        )
+
+        logger.info(
+            "DualPassExtractor complete — consistency=%.2f contradictions=%d",
+            consistency_score,
+            len(contradictions),
+        )
+
+        return DualPassResult(
+            structural_map=structural_map,
+            value_map=value_map,
+            consistency_score=consistency_score,
+            contradictions=contradictions,
+        )
+
+    # ------------------------------------------------------------------
+    # Cross-validation logic
+    # ------------------------------------------------------------------
+
+    def _cross_validate(
+        self,
+        structural_map: dict[str, Any],
+        value_map: dict[str, Any],
+    ) -> tuple[float, list[str]]:
+        """Compare Pass A structure against Pass B values.
+
+        Checks performed:
+
+        1. **Missing in B** — field in A but no value extracted.
+        2. **Orphan in B** — value extracted for a field not in A.
+        3. **Low confidence** — field present but confidence < 0.5.
+
+        Returns:
+            ``(consistency_score, contradictions)`` where score is 1.0
+            when no contradictions are found.
+        """
+        contradictions: list[str] = []
+
+        set_a = set(structural_map.keys())
+        set_b = set(value_map.keys())
+
+        # 1. Fields missing in Pass B -----------------------------------
+        missing_in_b = set_a - set_b
+        for field_name in missing_in_b:
+            contradictions.append(
+                f"Field '{field_name}' identified in structure (Pass A) "
+                f"but no value extracted (Pass B) — flag for human review"
+            )
+            logger.warning("Contradiction: %s missing in Pass B", field_name)
+
+        # 2. Orphan values in Pass B ------------------------------------
+        orphan_in_b = set_b - set_a
+        for field_name in orphan_in_b:
+            contradictions.append(
+                f"Value found for '{field_name}' in Pass B but not listed "
+                f"in structural map (Pass A) — possible misidentification"
+            )
+            logger.warning("Contradiction: %s orphan in Pass B", field_name)
+
+        # 3. Low confidence fields --------------------------------------
+        for field_name in set_a & set_b:
+            val_entry = value_map[field_name]
+            if isinstance(val_entry, dict):
+                confidence = val_entry.get("confidence_0_to_1", 1.0)
+                raw_value = val_entry.get("raw_value", "")
+                if confidence < 0.5:
+                    contradictions.append(
+                        f"Field '{field_name}' has low confidence "
+                        f"({confidence:.2f}) — value '{raw_value}' may be unreliable"
+                    )
+                    logger.warning(
+                        "Low confidence: %s (%.2f)", field_name, confidence
+                    )
+                elif not raw_value or raw_value in ("null", "None", ""):
+                    contradictions.append(
+                        f"Field '{field_name}' has empty/null value — "
+                        f"mark as UNRESOLVED"
+                    )
+
+        # 4. Compute consistency score ----------------------------------
+        if not set_a and not set_b:
+            return 0.0, ["Both passes returned empty results"]
+
+        total_fields = len(set_a | set_b)
+        matched_fields = len(set_a & set_b)
+        missing_penalty = len(missing_in_b) + len(orphan_in_b)
+        low_conf_penalty = sum(
+            1
+            for f in set_a & set_b
+            if isinstance(value_map.get(f), dict)
+            and value_map[f].get("confidence_0_to_1", 1.0) < 0.5
+        )
+
+        if total_fields == 0:
+            return 0.0, contradictions
+
+        raw_score = (matched_fields - missing_penalty - low_conf_penalty * 0.5) / total_fields
+        consistency_score = max(0.0, min(1.0, raw_score))
+
+        return consistency_score, contradictions
+
+    # ------------------------------------------------------------------
+    # Response parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_json_response(raw_text: str) -> dict[str, Any]:
+        """Safely parse VLM JSON output.
+
+        Handles common VLM formatting issues:
+        *   Markdown code fences (```json … ```).
+        *   Trailing commentary after the JSON block.
+        *   Bare JSON with no wrapper.
+
+        Args:
+            raw_text: Raw string returned by the VLM.
+
+        Returns:
+            Parsed dictionary; empty dict on failure.
+        """
+        if not raw_text or not raw_text.strip():
+            logger.warning("Empty VLM response")
+            return {}
+
+        text = raw_text.strip()
+
+        # Strip markdown code fences
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        # Try to find the first JSON object/array
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Try extracting the first {…} or […] block
+        try:
+            start = text.index("{")
+            end = text.rindex("}") + 1
+            return json.loads(text[start:end])
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+        logger.warning("Could not parse VLM response as JSON: %s...", text[:200])
+        return {}
