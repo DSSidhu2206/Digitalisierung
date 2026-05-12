@@ -116,6 +116,15 @@ async def verify_file_type(file: UploadFile = File(...)) -> UploadFile:
             ".tif": "image/tiff",
             ".bmp": "image/bmp",
             ".pdf": "application/pdf",
+            ".txt": "text/plain",
+            ".csv": "text/csv",
+            ".tsv": "text/tab-separated-values",
+            ".md": "text/markdown",
+            ".json": "application/json",
+            ".xml": "application/xml",
+            ".html": "text/html",
+            ".htm": "text/html",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         }
         content_type = ext_map.get(ext)
 
@@ -129,7 +138,8 @@ async def verify_file_type(file: UploadFile = File(...)) -> UploadFile:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 f"Unsupported file type: '{content_type}'. "
-                f"Allowed types: PNG, JPG, JPEG, TIFF, BMP, PDF."
+                "Allowed types: PNG, JPG, JPEG, TIFF, BMP, PDF, TXT, CSV, "
+                "TSV, Markdown, JSON, XML, HTML, and DOCX."
             ),
         )
 

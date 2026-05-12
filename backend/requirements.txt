@@ -11,6 +11,7 @@ pydantic-settings>=2.7.0
 
 # Structured LLM output
 instructor>=1.0.0
+rich>=13.7.0,<15.0.0
 
 # File uploads
 python-multipart>=0.0.17
@@ -21,8 +22,8 @@ psutil>=6.1.0
 # Environment variables
 python-dotenv>=1.0.0
 
-# Image processing — MUST be 11.0.0+ for Python 3.13 wheel
-pillow>=11.0.0
+# Image processing - Surya 0.17.x pins Pillow below 11
+pillow>=10.2.0,<11.0.0
 
 # Numerical computing — MUST be 2.1.0+ for Python 3.13 wheel
 numpy>=2.1.0
@@ -33,10 +34,11 @@ chromadb>=0.6.0
 # Sentence embeddings
 sentence-transformers>=3.3.0
 
-# Apple Silicon MLX (auto-installed on macOS, skipped elsewhere)
-mlx>=0.23.0; sys_platform == "darwin"
-mlx-vlm>=0.1.14; sys_platform == "darwin"
+# Neural document OCR/layout extraction
+surya-ocr>=0.17.1
+transformers>=4.56.1,<5.0.0
 
 # LLM inference via llama.cpp (auto-installed on macOS, skipped elsewhere)
 llama-cpp-python>=0.3.5; sys_platform == "darwin"
 pytesseract>=0.3.10
+pypdf>=5.0.0

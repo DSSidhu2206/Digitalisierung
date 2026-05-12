@@ -159,6 +159,13 @@ class CorrectionCapture:
             document_type=document_type,
             n_results=cap,
         )
+        if not corrections and document_type != "Unbekannt":
+            corrections = self._chroma.retrieve_relevant(
+                field_name=field_name,
+                current_text=current_text,
+                document_type="Unbekannt",
+                n_results=cap,
+            )
 
         if not corrections:
             return ""

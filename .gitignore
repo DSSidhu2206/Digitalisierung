@@ -194,5 +194,19 @@ dist/
 backend/chroma_data/
 backend/logs/
 backend/uploads/
+chroma_data/
+logs/
+uploads/
+frontend/tsconfig.tsbuildinfo
 .DS_Store
 backend/models/
+models/
+# --- RVL-CDIP dataset ---
+documents/rvl_cdip/
+documents/.DS_Store
+documents/image_learning_progress.json
+documents/image_learning_progress_smoke.json
+documents/rvl_cdip_manifest.json
+documents/rvl_cdip_progress.json
+*.tif
+*.tiff

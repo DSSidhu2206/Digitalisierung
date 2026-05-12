@@ -48,12 +48,15 @@ from app.api.models import (
     ErrorResponse,
     ExtractResponse,
     HealthResponse,
+    LocalTrainingStartRequest,
+    LocalTrainingStatusResponse,
     RefusalResponse,
     StatsResponse,
 )
 from config import APP_VERSION, get_settings
 from app.models import DocumentType, ExtractionResult, FieldResult, FieldStatus
 from app.pipeline.audit_logger import AuditLogger
+from app.pipeline.local_training import TrainingConfig
 from app.pipeline.orchestrator import ExtractionPipeline
 
 logger = logging.getLogger(__name__)
@@ -382,17 +385,77 @@ async def get_stats(
     - ``model_versions`` — lists of VLM / LLM models used
     - ``total_corrections`` — corrections in ChromaDB
     """
-    stats: dict[str, Any] = pipeline.get_stats()
+    stats_result = pipeline.get_stats()
+    if hasattr(stats_result, "__await__"):
+        stats_result = await stats_result
+    stats: dict[str, Any] = stats_result
+    audit_stats = stats.get("audit", stats)
+    correction_stats = stats.get("corrections", {})
+    image_learning_stats = stats.get("image_learning", {})
 
     return StatsResponse(
-        total_extractions=stats.get("total_extractions", 0),
-        avg_confidence=stats.get("avg_confidence", 0.0),
-        unresolved_rate=stats.get("unresolved_rate", 0.0),
-        avg_processing_time_ms=stats.get("avg_processing_time_ms", 0.0),
-        document_type_breakdown=stats.get("document_type_breakdown", {}),
-        model_versions=stats.get("model_versions", {"vlm": [], "llm": []}),
-        total_corrections=stats.get("total_corrections", 0),
+        total_extractions=audit_stats.get("total_extractions", 0),
+        avg_confidence=audit_stats.get("avg_confidence", 0.0),
+        unresolved_rate=audit_stats.get("unresolved_rate", 0.0),
+        avg_processing_time_ms=audit_stats.get("avg_processing_time_ms", 0.0),
+        document_type_breakdown=audit_stats.get("document_type_breakdown", {}),
+        model_versions=audit_stats.get("model_versions", {"vlm": [], "llm": []}),
+        total_corrections=correction_stats.get("total", stats.get("total_corrections", 0)),
+        total_learned_images=image_learning_stats.get("total_images", 0),
     )
+
+
+# ---------------------------------------------------------------------------
+# Local training controls
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/local-training/status",
+    response_model=LocalTrainingStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get local image-learning status",
+)
+async def get_local_training_status(
+    pipeline: ExtractionPipeline = Depends(get_pipeline),
+) -> LocalTrainingStatusResponse:
+    """Return current local RVL image-learning status."""
+    return LocalTrainingStatusResponse(**pipeline.local_training.status())
+
+
+@router.post(
+    "/local-training/start",
+    response_model=LocalTrainingStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Start or resume local image learning",
+)
+async def start_local_training(
+    body: LocalTrainingStartRequest,
+    pipeline: ExtractionPipeline = Depends(get_pipeline),
+) -> LocalTrainingStatusResponse:
+    """Start a resumable local learning chunk for the RVL corpus."""
+    training_status = pipeline.local_training.start(
+        TrainingConfig(
+            batch_size=body.batch_size,
+            max_seconds=body.max_seconds,
+            plateau_window=body.plateau_window,
+            heartbeat_seconds=body.heartbeat_seconds,
+        )
+    )
+    return LocalTrainingStatusResponse(**training_status)
+
+
+@router.post(
+    "/local-training/stop",
+    response_model=LocalTrainingStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Stop local image learning",
+)
+async def stop_local_training(
+    pipeline: ExtractionPipeline = Depends(get_pipeline),
+) -> LocalTrainingStatusResponse:
+    """Stop the currently managed local learning process."""
+    return LocalTrainingStatusResponse(**pipeline.local_training.stop())
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ class ExtractResponse(BaseModel):
                 "metadata": {
                     "extraction_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                     "timestamp": "2024-01-15T10:30:00+00:00",
-                    "vlm_model": "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit",
+                    "vlm_model": "surya-ocr",
                     "llm_model": "llama-3.1-8b-instruct",
                     "processing_time_ms": 1234.5,
                 },
@@ -130,10 +130,11 @@ class StatsResponse(BaseModel):
                 "Gehaltsausweis": 10,
             },
             "model_versions": {
-                "vlm": ["mlx-community/Llama-3.2-11B-Vision-Instruct-4bit"],
+                "vlm": ["surya-ocr"],
                 "llm": ["llama-3.1-8b-instruct"],
             },
             "total_corrections": 5,
+            "total_learned_images": 50000,
         }
     })
 
@@ -158,6 +159,62 @@ class StatsResponse(BaseModel):
     total_corrections: int = Field(
         default=0, ge=0, description="Total user corrections stored in ChromaDB"
     )
+    total_learned_images: int = Field(
+        default=0, ge=0, description="Total images ingested into the learning corpus"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Local Training
+# ---------------------------------------------------------------------------
+
+
+class LocalTrainingStartRequest(BaseModel):
+    """Request body for starting a local image-learning job."""
+
+    batch_size: int = Field(default=64, ge=1, le=1024)
+    max_seconds: int = Field(default=3300, ge=30, le=86_400)
+    plateau_window: int = Field(default=50_000, ge=1, le=500_000)
+    heartbeat_seconds: float = Field(default=1.0, ge=0.25, le=60.0)
+
+
+class LocalTrainingStatusResponse(BaseModel):
+    """Current status of local RVL image learning."""
+
+    state: str = Field(..., description="idle, running, stopped, or external")
+    running: bool = Field(..., description="Whether this API process owns a running job")
+    pid: Optional[int] = Field(default=None, description="Managed process id, if running")
+    started_at: Optional[float] = Field(default=None, description="Unix timestamp when job started")
+    processed: int = Field(default=0, ge=0)
+    run_processed: int = Field(default=0, ge=0)
+    stored: int = Field(default=0, ge=0)
+    skipped: int = Field(default=0, ge=0)
+    pending_batch: int = Field(default=0, ge=0)
+    total_images: int = Field(default=0, ge=0)
+    progress_pct: float = Field(default=0.0, ge=0.0)
+    processed_progress_pct: float = Field(default=0.0, ge=0.0)
+    indexed_progress_pct: float = Field(default=0.0, ge=0.0)
+    images_per_second: float = Field(default=0.0, ge=0.0)
+    updated_at: Optional[str] = None
+    updated_at_epoch: Optional[float] = None
+    heartbeat_age_seconds: Optional[float] = None
+    current_file: Optional[str] = None
+    current_index: Optional[int] = None
+    last_event: Optional[str] = None
+    learning_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    avg_quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    avg_ocr_chars: float = Field(default=0.0, ge=0.0)
+    ocr_coverage_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    visual_hash_coverage_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    vector_index_enabled: bool = False
+    ocr_engine: str = Field(default="surya-ocr")
+    ocr_batch_size: int = Field(default=32, ge=1)
+    surya_device: str = Field(default="auto")
+    surya_recognition_batch_size: int = Field(default=32, ge=1)
+    surya_detector_batch_size: int = Field(default=4, ge=1)
+    surya_task_name: str = Field(default="ocr_without_boxes")
+    top_labels: Dict[str, int] = Field(default_factory=dict)
+    recent_log: List[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

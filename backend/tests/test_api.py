@@ -101,7 +101,7 @@ def sample_extraction_result() -> ExtractionResult:
     return ExtractionResult(
         metadata=ExtractionMetadata(
             extraction_id=extraction_id,
-            vlm_model="mlx-community/Llama-3.2-11B-Vision-Instruct-4bit",
+            vlm_model="surya-ocr",
             llm_model="llama-3.1-8b-instruct",
             processing_time_ms=1234.5,
             phases_completed=[
@@ -441,7 +441,7 @@ class TestGetStats:
                 "Gehaltsausweis": 10,
             },
             "model_versions": {
-                "vlm": ["mlx-community/Llama-3.2-11B-Vision-Instruct-4bit"],
+                "vlm": ["surya-ocr"],
                 "llm": ["llama-3.1-8b-instruct"],
             },
             "total_corrections": 5,
@@ -614,13 +614,13 @@ class TestFileValidation:
         )
         assert response.status_code == status.HTTP_200_OK
 
-    def test_invalid_txt_rejected(self, client: TestClient) -> None:
-        """Plain text file is rejected (400)."""
+    def test_valid_txt(self, client: TestClient) -> None:
+        """Plain text file passes validation for file-text extraction."""
         response = client.post(
             "/api/v1/extract",
             files={"file": ("test.txt", io.BytesIO(b"not an image"), "text/plain")},
         )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_200_OK
 
     def test_invalid_gif_rejected(self, client: TestClient) -> None:
         """GIF file is rejected (not in allowed list)."""

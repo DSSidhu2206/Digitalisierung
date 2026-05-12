@@ -31,7 +31,7 @@
 - Added missing `use_mocks`, `audit_log_path`, `chroma_persist_dir` to ExtractionPipeline
 - Added missing `dual_pass`, `validator`, `prompt_builder`, `ram` properties to ExtractionPipeline
 - Added `get_history()` and `rotate_logs()` to AuditLogger
-- Fixed VLMManager file-not-found check order (now checked before MLX availability)
+- Swapped VLMManager to the Surya OCR adapter and kept file-not-found checks before inference
 
 ### Test Fixes
 - Fixed all 7 validator test failures

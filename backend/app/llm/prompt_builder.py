@@ -263,4 +263,3 @@ class PromptBuilder:
             document_type,
             "Extract all visible fields. Mark unclear fields as UNRESOLVED.",
         )
-      )

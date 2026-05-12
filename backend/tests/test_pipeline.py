@@ -36,7 +36,12 @@ from app.models.extraction_models import (
     ExtractionResult,
     FieldResult,
 )
+from app.database.image_learning_store import ImageLearningStore, LearnedImageRecord
 from app.pipeline import AuditLogger, ExtractionPipeline, RAMManager
+from app.vision.quality_gate import (
+    DocumentType as QualityDocumentType,
+    QualityAssessment,
+)
 
 
 # =========================================================================
@@ -420,12 +425,12 @@ class TestExtractionPipeline:
         """Mock mode flag is set correctly."""
         assert pipeline.use_mocks is True
 
-    @pytest.mark.asyncio
-    async def test_get_stats_returns_dict(self, pipeline: ExtractionPipeline) -> None:
+    def test_get_stats_returns_dict(self, pipeline: ExtractionPipeline) -> None:
         """get_stats returns a dictionary with expected keys."""
-        stats = await pipeline.get_stats()
+        stats = asyncio.run(pipeline.get_stats())
         assert "audit" in stats
         assert "corrections" in stats
+        assert "image_learning" in stats
         assert "mock_mode" in stats
 
     @pytest.mark.asyncio
@@ -478,6 +483,91 @@ class TestExtractionPipeline:
         """Pipeline has a QualityGate instance."""
         assert pipeline.quality_gate is not None
 
+    def test_unknown_document_uses_dual_pass_fallback(
+        self, pipeline: ExtractionPipeline
+    ) -> None:
+        """Unclassified images should still return extracted fields."""
+        tmp_dir = Path(pipeline.chroma._persist_dir).parent
+        test_image = tmp_dir / "unknown_doc.png"
+        _create_quality_test_image(str(test_image))
+
+        pipeline.quality_gate.assess = lambda _: QualityAssessment(
+            legibility_score=0.85,
+            orientation="correct",
+            form_type=QualityDocumentType.UNBEKANNT,
+            is_admissible=True,
+        )
+
+        result = asyncio.run(pipeline.process(str(test_image)))
+
+        assert "_refusal" not in result.fields
+        assert result.document_type == DocumentType.UNBEKANNT
+        assert len(result.fields) > 1
+        assert result.overall_confidence > 0.0
+
+    def test_dirty_image_continues_with_low_confidence_fields(
+        self, pipeline: ExtractionPipeline
+    ) -> None:
+        """Dirty but readable images should not collapse to 0% confidence."""
+        tmp_dir = Path(pipeline.chroma._persist_dir).parent
+        test_image = tmp_dir / "dirty_doc.png"
+        _create_quality_test_image(str(test_image))
+
+        pipeline.quality_gate.assess = lambda _: QualityAssessment(
+            legibility_score=0.45,
+            orientation="correct",
+            form_type=QualityDocumentType.UNBEKANNT,
+            is_admissible=False,
+            rejection_reason="low contrast and blur",
+        )
+
+        result = asyncio.run(pipeline.process(str(test_image)))
+
+        assert "_refusal" not in result.fields
+        assert len(result.fields) > 1
+        assert result.overall_confidence > 0.0
+        assert all(field.confidence < 0.7 for field in result.fields.values())
+        assert any(
+            field.status == FieldStatus.LOW_CONFIDENCE
+            for field in result.fields.values()
+        )
+
+    def test_hopeless_image_still_refuses(
+        self, pipeline: ExtractionPipeline
+    ) -> None:
+        """Completely unreadable images should keep the refusal path."""
+        tmp_dir = Path(pipeline.chroma._persist_dir).parent
+        test_image = tmp_dir / "hopeless_doc.png"
+        _create_quality_test_image(str(test_image))
+
+        pipeline.quality_gate.assess = lambda _: QualityAssessment(
+            legibility_score=0.05,
+            orientation="correct",
+            form_type=QualityDocumentType.UNBEKANNT,
+            is_admissible=False,
+            rejection_reason="unreadable image",
+        )
+
+        result = asyncio.run(pipeline.process(str(test_image)))
+
+        assert "_refusal" in result.fields
+        assert result.overall_confidence == 0.0
+
+    def test_text_file_extraction_returns_fields(
+        self, pipeline: ExtractionPipeline
+    ) -> None:
+        """Text/data files should bypass image quality gate and extract values."""
+        tmp_dir = Path(pipeline.chroma._persist_dir).parent
+        text_file = tmp_dir / "invoice.txt"
+        text_file.write_text("Invoice Number: A-100\nTotal: 42.50\n", encoding="utf-8")
+
+        result = asyncio.run(pipeline.process(str(text_file)))
+
+        assert result.document_type == DocumentType.UNBEKANNT
+        assert "invoice_number" in result.fields
+        assert result.fields["invoice_number"].value == "A-100"
+        assert result.fields["total"].value == "42.50"
+
     @pytest.mark.asyncio
     async def test_dual_pass_not_none(self, pipeline: ExtractionPipeline) -> None:
         """Pipeline has a DualPassExtractor instance."""
@@ -502,6 +592,43 @@ class TestExtractionPipeline:
     async def test_audit_logger_not_none(self, pipeline: ExtractionPipeline) -> None:
         """Pipeline has an AuditLogger instance."""
         assert pipeline.audit_logger is not None
+
+
+class TestImageLearningStore:
+    """Tests for the persistent image-learning memory."""
+
+    def test_add_and_retrieve_learning_record(self, tmp_path: Path) -> None:
+        store = ImageLearningStore(persist_dir=str(tmp_path / "chroma"))
+        record = LearnedImageRecord(
+            image_id="abc123",
+            image_path="/tmp/example.tif",
+            filename="example.tif",
+            source_split="train",
+            label_name="invoice",
+            label_index=11,
+            width=754,
+            height=1000,
+            file_size=12345,
+            sha256="abc123",
+            quality_score=0.42,
+            form_type="Unbekannt",
+            orientation="correct",
+            ocr_text="invoice total amount due",
+        )
+
+        try:
+            assert store.add_records([record]) == 1
+            assert store.add_records([record]) == 0
+
+            stats = store.stats()
+            assert stats["total_images"] == 1
+
+            examples = store.retrieve_similar("invoice total", limit=1)
+            assert len(examples) == 1
+            assert examples[0]["filename"] == "example.tif"
+            assert "invoice total" in examples[0]["ocr_text"]
+        finally:
+            store.close()
 
 
 # =========================================================================

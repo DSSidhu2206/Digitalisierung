@@ -22,10 +22,13 @@ import asyncio
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 from uuid import UUID
 
 from app.database.chroma_manager import ChromaManager
+from app.database.image_learning_store import ImageLearningStore
+from app.ingestion.file_text_extractor import FileTextExtractor
 from app.models import (
     BoundingBox,
     DocumentType,
@@ -36,7 +39,9 @@ from app.models import (
     FieldStatus,
 )
 from app.pipeline.audit_logger import AuditLogger
+from app.pipeline.local_training import LocalTrainingManager
 from app.vision.quality_gate import QualityGate
+from app.vision.vlm_loader import VLMManager
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,9 @@ class ExtractionPipeline:
     by the RAM manager for sequential processing.
     """
 
+    DEGRADED_LEGIBILITY_THRESHOLD = 0.20
+    LOW_CONFIDENCE_THRESHOLD = 0.70
+
     def __init__(
         self,
         use_mocks: bool = False,
@@ -66,8 +74,13 @@ class ExtractionPipeline:
             audit_log_path: Override path for the audit JSONL log.
             chroma_persist_dir: Override directory for ChromaDB persistence.
         """
+        project_root = Path(__file__).resolve().parents[3]
+        image_learning_dir = chroma_persist_dir or str(project_root / "chroma_data")
         self.quality_gate = QualityGate()
         self.chroma = ChromaManager(persist_dir=chroma_persist_dir or "./chroma_data")
+        self.image_learning = ImageLearningStore(persist_dir=image_learning_dir)
+        self.local_training = LocalTrainingManager(project_root, self.image_learning)
+        self.file_text_extractor = FileTextExtractor()
         self.audit_logger = AuditLogger(
             log_path=audit_log_path or "./logs/audit.jsonl"
         )
@@ -103,21 +116,33 @@ class ExtractionPipeline:
         start_time: float = time.perf_counter()
         phases: list[ExtractionPhase] = []
 
+        if not self.file_text_extractor.is_image(image_path):
+            return self._text_file_extraction_result(
+                image_path,
+                start_time,
+                phases,
+            )
+
         # --- Stage 1: Quality Gate --------------------------------------
         try:
             assessment = self.quality_gate.assess(image_path)
             phases.append(ExtractionPhase.QUALITY_GATE)
 
             if not assessment.is_admissible:
+                if assessment.legibility_score < self.DEGRADED_LEGIBILITY_THRESHOLD:
+                    logger.warning(
+                        "Quality gate refused: %s", assessment.rejection_reason
+                    )
+                    return self._refusal_result(
+                        reason=assessment.rejection_reason or "Image refused by quality gate",
+                        vlm_model="stub",
+                        llm_model="stub",
+                        start_time=start_time,
+                        phases=phases,
+                    )
                 logger.warning(
-                    "Quality gate refused: %s", assessment.rejection_reason
-                )
-                return self._refusal_result(
-                    reason=assessment.rejection_reason or "Image refused by quality gate",
-                    vlm_model="stub",
-                    llm_model="stub",
-                    start_time=start_time,
-                    phases=phases,
+                    "Quality gate continuing in degraded mode: %s",
+                    assessment.rejection_reason,
                 )
 
             detected_doc_type = DocumentType(assessment.form_type.value)
@@ -131,8 +156,7 @@ class ExtractionPipeline:
                 phases=phases,
             )
 
-        # --- Stage 2-5: Run pipeline with mock results for now ---------
-        # TODO: Integrate real VLM + LLM + validation pipeline
+        # --- Stage 2-5: Run Surya extraction and validation -------------
         try:
             phases.extend([
                 ExtractionPhase.VISION_PASS_A,
@@ -142,9 +166,10 @@ class ExtractionPipeline:
                 ExtractionPhase.LLM_STRUCTURING,
             ])
 
-            result = self._mock_extraction_result(
+            result = await self._dual_pass_extraction_result(
                 document_type=detected_doc_type,
                 image_path=image_path,
+                assessment=assessment,
                 start_time=start_time,
                 phases=phases,
             )
@@ -271,6 +296,7 @@ class ExtractionPipeline:
         return {
             "audit": audit_stats,
             "corrections": chroma_stats,
+            "image_learning": self.image_learning.stats(),
             "mock_mode": self._use_mocks,
         }
 
@@ -400,7 +426,7 @@ class ExtractionPipeline:
         TODO: Replace with real VLM + LLM integration.
         """
         metadata = ExtractionMetadata(
-            vlm_model="mlx-community/Llama-3.2-11B-Vision-Instruct-4bit",
+            vlm_model=VLMManager.MODEL_ID,
             llm_model="llama-3.1-8b-instruct",
             document_type=document_type,
             phases_completed=phases,
@@ -432,6 +458,236 @@ class ExtractionPipeline:
             document_type=document_type,
             fields=fields,
         )
+
+    def _text_file_extraction_result(
+        self,
+        file_path: str,
+        start_time: float,
+        phases: list[ExtractionPhase],
+    ) -> ExtractionResult:
+        """Extract structured key/value candidates from a non-image file."""
+        extracted = self.file_text_extractor.extract(file_path)
+        phases.extend([
+            ExtractionPhase.QUALITY_GATE,
+            ExtractionPhase.LLM_STRUCTURING,
+            ExtractionPhase.SYMBOLIC_VALIDATION,
+        ])
+        fields = self._fields_from_text(extracted.text)
+        if not fields:
+            fields = {
+                "_text": FieldResult(
+                    field_name="_text",
+                    value=extracted.text[:5000] or None,
+                    status=FieldStatus.LOW_CONFIDENCE if extracted.text else FieldStatus.UNRESOLVED,
+                    confidence=0.35 if extracted.text else 0.0,
+                    raw_text=extracted.text[:5000] or None,
+                    validation_message=(
+                        f"Parsed with {extracted.parser}; no stable key/value fields found"
+                    ),
+                )
+            }
+
+        metadata = ExtractionMetadata(
+            vlm_model="file-text-extractor",
+            llm_model="rule-based-key-value",
+            document_type=DocumentType.UNBEKANNT,
+            phases_completed=phases,
+            processing_time_ms=(time.perf_counter() - start_time) * 1000,
+        )
+        result = ExtractionResult(
+            metadata=metadata,
+            document_type=DocumentType.UNBEKANNT,
+            fields=fields,
+        )
+        try:
+            self.audit_logger.log(result)
+        except Exception as exc:
+            logger.error("Audit logging error (non-fatal): %s", exc)
+        self._extraction_store[str(result.metadata.extraction_id)] = result
+        return result
+
+    def _fields_from_text(self, text: str) -> dict[str, FieldResult]:
+        """Extract conservative key/value candidates from text."""
+        fields: dict[str, FieldResult] = {}
+        for line in text.splitlines()[:5000]:
+            cleaned = " ".join(line.strip().split())
+            if not cleaned or len(cleaned) > 500:
+                continue
+            key = ""
+            value = ""
+            if ":" in cleaned:
+                key, value = cleaned.split(":", 1)
+            elif "|" in cleaned:
+                parts = [part.strip() for part in cleaned.split("|") if part.strip()]
+                if len(parts) == 2:
+                    key, value = parts
+            if not key or not value:
+                continue
+            field_name = self._normalise_text_field_name(key)
+            if not field_name or field_name in fields:
+                continue
+            confidence = 0.65 if len(value.strip()) >= 2 else 0.3
+            fields[field_name] = FieldResult(
+                field_name=field_name,
+                value=value.strip()[:1000],
+                status=(
+                    FieldStatus.LOW_CONFIDENCE
+                    if confidence < self.LOW_CONFIDENCE_THRESHOLD
+                    else FieldStatus.EXTRACTED
+                ),
+                confidence=confidence,
+                raw_text=cleaned,
+                validation_message="Rule-based file text extraction",
+            )
+            if len(fields) >= 200:
+                break
+        return fields
+
+    @staticmethod
+    def _normalise_text_field_name(key: str) -> str:
+        field = "".join(ch.lower() if ch.isalnum() else "_" for ch in key.strip())
+        field = "_".join(part for part in field.split("_") if part)
+        if not field or field[0].isdigit():
+            field = f"field_{field}" if field else ""
+        return field[:80]
+
+    async def _dual_pass_extraction_result(
+        self,
+        document_type: DocumentType,
+        image_path: str,
+        assessment: Any,
+        start_time: float,
+        phases: list[ExtractionPhase],
+    ) -> ExtractionResult:
+        """Build an extraction result from the dual-pass vision output.
+
+        This path is intentionally used for degraded or unclassified images.
+        It preserves partially readable values as low-confidence review items
+        instead of collapsing the whole request to a single 0-confidence
+        refusal field.
+        """
+        metadata = ExtractionMetadata(
+            vlm_model=VLMManager.MODEL_ID,
+            llm_model="dual-pass-only",
+            document_type=document_type,
+            phases_completed=phases,
+            processing_time_ms=(time.perf_counter() - start_time) * 1000,
+        )
+        learned_examples = self.image_learning.retrieve_similar(
+            query_text=(
+                f"document_type={document_type.value}\n"
+                f"quality={float(assessment.legibility_score):.2f}\n"
+                f"orientation={assessment.orientation}"
+            ),
+            document_type=document_type.value,
+        )
+        metadata.few_shot_injections = len(learned_examples)
+        learned_context = self.image_learning.build_prompt_section(learned_examples)
+
+        async def run_dual_pass(vlm: Any) -> Any:
+            return self.dual_pass.extract(
+                image_path,
+                vlm,
+                learned_context=learned_context,
+            )
+
+        dual_result = await self.ram.with_vlm(run_dual_pass)
+        fields = self._fields_from_dual_pass(dual_result, assessment)
+        if not fields:
+            reason = "No readable fields found after degraded dual-pass extraction"
+            fields = {
+                "_unresolved": FieldResult(
+                    field_name="_unresolved",
+                    value=None,
+                    status=FieldStatus.UNRESOLVED,
+                    confidence=max(0.0, min(float(assessment.legibility_score), 0.25)),
+                    validation_message=reason,
+                )
+            }
+
+        return ExtractionResult(
+            metadata=metadata,
+            document_type=document_type,
+            fields=fields,
+        )
+
+    def _fields_from_dual_pass(
+        self,
+        dual_result: Any,
+        assessment: Any,
+    ) -> dict[str, FieldResult]:
+        """Convert dual-pass values into reviewable field results."""
+        fields: dict[str, FieldResult] = {}
+        quality_factor = max(0.25, min(float(assessment.legibility_score), 1.0))
+        if not assessment.is_admissible:
+            quality_factor = min(quality_factor, 0.49)
+
+        warning = assessment.rejection_reason
+        for field_name, value_entry in dual_result.value_map.items():
+            if not isinstance(value_entry, dict):
+                continue
+
+            raw_confidence = self._coerce_confidence(
+                value_entry.get("confidence_0_to_1", 0.0)
+            )
+            confidence = max(0.0, min(raw_confidence * quality_factor, 1.0))
+            raw_value = value_entry.get("raw_value")
+            has_value = raw_value not in (None, "", "null", "None")
+
+            if not has_value:
+                status = FieldStatus.UNRESOLVED
+            elif confidence < self.LOW_CONFIDENCE_THRESHOLD:
+                status = FieldStatus.LOW_CONFIDENCE
+            else:
+                status = FieldStatus.EXTRACTED
+
+            fields[field_name] = FieldResult(
+                field_name=field_name,
+                value=raw_value if has_value else None,
+                status=status,
+                confidence=confidence,
+                source_bbox=self._bbox_from_structure(
+                    dual_result.structural_map.get(field_name, {})
+                ),
+                raw_text=str(raw_value) if raw_value is not None else None,
+                validation_message=warning if status != FieldStatus.EXTRACTED else None,
+            )
+
+        for field_name in set(dual_result.structural_map) - set(fields):
+            fields[field_name] = FieldResult(
+                field_name=field_name,
+                value=None,
+                status=FieldStatus.UNRESOLVED,
+                confidence=0.0,
+                source_bbox=self._bbox_from_structure(
+                    dual_result.structural_map.get(field_name, {})
+                ),
+                validation_message="Field detected but no value was readable",
+            )
+
+        return fields
+
+    @staticmethod
+    def _coerce_confidence(value: Any) -> float:
+        """Return *value* as a bounded confidence float."""
+        try:
+            return max(0.0, min(float(value), 1.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _bbox_from_structure(structure_entry: Any) -> Optional[BoundingBox]:
+        """Build a BoundingBox from dual-pass structural metadata."""
+        if not isinstance(structure_entry, dict):
+            return None
+        bbox_data = structure_entry.get("estimated_bbox")
+        if not isinstance(bbox_data, dict):
+            return None
+        try:
+            bbox = BoundingBox(**bbox_data)
+            return bbox if bbox.is_valid() else None
+        except Exception:
+            return None
 
     def _partial_error_result(
         self,

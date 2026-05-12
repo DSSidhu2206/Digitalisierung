@@ -73,7 +73,7 @@ class TestVLMManager(unittest.TestCase):
 
     def test_vlm_manager_model_id_constant(self):
         """MODEL_ID matches the spec."""
-        assert VLMManager.MODEL_ID == "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit"
+        assert VLMManager.MODEL_ID == "surya-ocr"
 
     def test_vlm_manager_init_state(self):
         """Fresh instance has model=None and is_loaded=False."""
@@ -556,7 +556,7 @@ class TestVisionEngineIntegration(unittest.TestCase):
             os.unlink(img_path)
 
     def test_mock_mode_no_real_model(self):
-        """Verify MockVLMManager works entirely without mlx_vlm."""
+        """Verify MockVLMManager works entirely without Surya predictors."""
         # This test proves the entire vision engine runs in mock mode
         vlm = MockVLMManager()
         vlm.load()

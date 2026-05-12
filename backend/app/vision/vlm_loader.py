@@ -1,110 +1,77 @@
 """
-VLM Loader — MLX VLM integration with graceful fallback.
+Vision loader backed by Surya OCR.
 
-Manages the Llama-3.2-11B-Vision-Instruct-4bit model via mlx-vlm,
-with load/unload cycles for RAM management on Apple Silicon (M4).
-All mlx_vlm imports are wrapped in try/except for environments without
-MLX (testing, CI, non-macOS). Falls back to a MockVLMManager stub.
-
-Spec: Section 6.1 — VLM Loader
+Historically this module wrapped an MLX VLM.  The public interface is kept so
+the RAM manager and dual-pass pipeline do not need a broad rewrite, but the
+real extractor is now Surya OCR/layout analysis.
 """
 from __future__ import annotations
 
-import gc
 import json
 import logging
-import os
 import random
 import time
-from typing import Any, Optional, Protocol, Tuple, Union
+from pathlib import Path
+from typing import Any
+
+from app.vision.surya_extractor import SuryaDocumentExtractor, SuryaExtraction
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Attempt to import mlx_vlm; if unavailable, mark as unavailable so we can
-# fall back to stub mode.
-# ---------------------------------------------------------------------------
-try:
-    from mlx_vlm import load as _mlx_load
-    from mlx_vlm.utils import generate as _mlx_generate
-
-    _MLX_AVAILABLE = True
-except Exception:
-    _MLX_AVAILABLE = False
-    _mlx_load = None
-    _mlx_generate = None
-    logger.warning("mlx_vlm not available — falling back to stub mode")
-
-
-# ---------------------------------------------------------------------------
-# VLMManager
-# ---------------------------------------------------------------------------
 
 class VLMManager:
-    """MLX VLM with load/unload for Unified Memory RAM management.
+    """Surya-backed vision manager with the legacy VLMManager interface."""
 
-    Loads the quantized Llama-3.2-11B-Vision-Instruct-4bit model via
-    ``mlx_vlm`` on macOS with Apple Silicon.  In environments where
-    ``mlx_vlm`` is unavailable the manager transparently falls back to
-    *stub mode* (mock responses).
-
-    Attributes:
-        MODEL_ID: Hugging Face model identifier used by ``mlx_vlm.load``.
-    """
-
-    MODEL_ID: str = "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit"
+    MODEL_ID: str = SuryaDocumentExtractor.MODEL_ID
+    supports_direct_extraction: bool = True
 
     def __init__(self) -> None:
         self.model: Any = None
         self.processor: Any = None
         self._loaded: bool = False
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def load(self) -> None:
-        """Load model and processor into Unified Memory / GPU.
-
-        Raises:
-            RuntimeError: If MLX is not available on this platform.
-        """
-        if not _MLX_AVAILABLE:
-            raise RuntimeError(
-                "MLX VLM is not available on this platform. "
-                "Use MockVLMManager for testing / development."
-            )
-        logger.info("Loading VLM model %s ...", self.MODEL_ID)
-        self.model, self.processor = _mlx_load(self.MODEL_ID)
-        self._loaded = True
-        logger.info("VLM loaded successfully.")
-
-    def unload(self) -> None:
-        """Unload model / processor and force garbage collection.
-
-        This frees GPU-resident memory on Apple Silicon Unified Memory
-        architectures, which is critical when running sequentially with
-        the LLM (Section 8.1 RAM Manager).
-        """
-        logger.info("Unloading VLM ...")
-        self.model = None
-        self.processor = None
-        self._loaded = False
-        gc.collect()
-        logger.info("VLM unloaded and GC completed.")
-
-    # ------------------------------------------------------------------
-    # State
-    # ------------------------------------------------------------------
+        self._extractor = SuryaDocumentExtractor(enable_layout=True, allow_fallback=False)
+        self._last_image: str | None = None
+        self._last_extraction: SuryaExtraction | None = None
 
     @property
     def is_loaded(self) -> bool:
-        """Return whether the model is currently resident in memory."""
+        """Return whether Surya predictors are loaded."""
         return self._loaded
 
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
+    def load(self) -> None:
+        """Load Surya OCR/layout predictors."""
+        self._extractor.load()
+        self.model = self._extractor
+        self.processor = self.MODEL_ID
+        self._loaded = True
+        logger.info("Surya vision manager loaded with engine=%s", self._extractor.engine)
+
+    def unload(self) -> None:
+        """Unload Surya predictors and clear cached extraction state."""
+        self._extractor.unload()
+        self.model = None
+        self.processor = None
+        self._last_image = None
+        self._last_extraction = None
+        self._loaded = False
+        logger.info("Surya vision manager unloaded.")
+
+    def extract_document(
+        self,
+        image_path: str,
+        *,
+        with_layout: bool = True,
+    ) -> SuryaExtraction:
+        """Run Surya document extraction once for the image."""
+        if not self._loaded:
+            raise RuntimeError("VLM not loaded. Call load() before extract_document().")
+        path = str(Path(image_path))
+        if self._last_image == path and self._last_extraction is not None:
+            return self._last_extraction
+        extraction = self._extractor.extract(path, with_layout=with_layout)
+        self._last_image = path
+        self._last_extraction = extraction
+        return extraction
 
     def generate(
         self,
@@ -112,55 +79,118 @@ class VLMManager:
         prompt: str,
         max_tokens: int = 4096,
     ) -> str:
-        """Run VLM inference on *image_path* with *prompt*.
+        """Return JSON/text derived from one Surya extraction.
 
-        Args:
-            image_path: Absolute or relative path to the image file.
-            prompt: Text prompt forwarded to the vision model.
-            max_tokens: Maximum number of tokens to generate.
-
-        Returns:
-            Raw generated text string from the VLM.
-
-        Raises:
-            RuntimeError: If the model has not been loaded.
+        This keeps compatibility with older two-prompt code paths while avoiding
+        a heavyweight VLM generation dependency.
         """
         if not self._loaded:
             raise RuntimeError("VLM not loaded. Call load() before generate().")
-        if not os.path.isfile(image_path):
+        if not Path(image_path).is_file():
             raise FileNotFoundError(f"Image not found: {image_path}")
-        if not _MLX_AVAILABLE:
-            raise RuntimeError("MLX VLM is not available.")
 
-        logger.debug("VLM generate — image=%s prompt_len=%d", image_path, len(prompt))
-        output: str = _mlx_generate(
-            self.model,
-            self.processor,
-            image_path,
-            prompt,
-            verbose=False,
-            max_tokens=max_tokens,
-        )
-        return output
+        extraction = self.extract_document(image_path, with_layout=True)
+        prompt_lower = prompt.lower()
+        if "structural" in prompt_lower or "pass a" in prompt_lower:
+            return json.dumps(
+                self._structural_map_from_extraction(extraction),
+                ensure_ascii=False,
+                indent=2,
+            )
+        if "value" in prompt_lower or "pass b" in prompt_lower:
+            return json.dumps(
+                self._value_map_from_extraction(extraction),
+                ensure_ascii=False,
+                indent=2,
+            )
+        return extraction.text[:max_tokens]
 
+    @classmethod
+    def _structural_map_from_extraction(
+        cls,
+        extraction: SuryaExtraction,
+    ) -> dict[str, dict[str, Any]]:
+        structural: dict[str, dict[str, Any]] = {}
+        for index, line in enumerate(extraction.lines, start=1):
+            key, _ = cls._split_line(line.text)
+            field_name = cls._unique_field_name(
+                structural,
+                cls._normalise_field_name(key or f"line_{index:04d}"),
+            )
+            structural[field_name] = {
+                "label_text": key or f"OCR line {index}",
+                "field_type": cls._infer_field_type(line.text),
+                "estimated_bbox": line.bbox,
+                "engine": extraction.engine,
+            }
+        return structural
 
-# ---------------------------------------------------------------------------
-# MockVLMManager — drop-in replacement for testing / dev without the model
-# ---------------------------------------------------------------------------
+    @classmethod
+    def _value_map_from_extraction(
+        cls,
+        extraction: SuryaExtraction,
+    ) -> dict[str, dict[str, Any]]:
+        values: dict[str, dict[str, Any]] = {}
+        for index, line in enumerate(extraction.lines, start=1):
+            key, value = cls._split_line(line.text)
+            field_name = cls._unique_field_name(
+                values,
+                cls._normalise_field_name(key or f"line_{index:04d}"),
+            )
+            values[field_name] = {
+                "raw_value": value or line.text,
+                "confidence_0_to_1": line.confidence,
+                "engine": extraction.engine,
+            }
+        return values
+
+    @staticmethod
+    def _split_line(text: str) -> tuple[str, str]:
+        cleaned = " ".join(text.strip().split())
+        for separator in (":", "=", "|"):
+            if separator in cleaned:
+                left, right = cleaned.split(separator, 1)
+                left = left.strip()
+                right = right.strip()
+                if left and right:
+                    return left, right
+        return "", cleaned
+
+    @staticmethod
+    def _normalise_field_name(value: str) -> str:
+        field = "".join(ch.lower() if ch.isalnum() else "_" for ch in value.strip())
+        field = "_".join(part for part in field.split("_") if part)
+        if not field:
+            return "field"
+        if field[0].isdigit():
+            field = f"field_{field}"
+        return field[:80]
+
+    @staticmethod
+    def _unique_field_name(existing: dict[str, Any], base: str) -> str:
+        candidate = base or "field"
+        suffix = 2
+        while candidate in existing:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    @staticmethod
+    def _infer_field_type(text: str) -> str:
+        stripped = text.strip()
+        digits = sum(ch.isdigit() for ch in stripped)
+        if digits >= 6 and any(ch in stripped for ch in (".", "/", "-")):
+            return "date"
+        if digits and digits >= max(1, len(stripped) // 2):
+            return "number"
+        return "text"
+
 
 class MockVLMManager(VLMManager):
-    """Stub VLM manager that returns realistic mock responses.
+    """Drop-in vision manager for tests and development without model weights."""
 
-    Useful for:
-    *   CI pipelines where MLX is not installed.
-    *   Frontend development without downloading 5.2 GB of weights.
-    *   Unit testing the Dual-Pass extractor and Quality Gate.
+    supports_direct_extraction = False
 
-    Inherits the same interface as :class:`VLMManager` but never touches
-    GPU memory.  ``load()`` / ``unload()`` are no-ops.
-    """
-
-    # Realistic mock responses keyed by pass type ---------------
     _MOCK_STRUCTURAL_RESPONSE: str = json.dumps(
         {
             "familienname": {
@@ -230,22 +260,20 @@ class MockVLMManager(VLMManager):
     )
 
     def __init__(self, seed: int = 42) -> None:
-        super().__init__()
+        self.model: Any = None
+        self.processor: Any = None
+        self._loaded = False
         self._rng = random.Random(seed)
 
-    # -- overrides -------------------------------------------------------
-
     def load(self) -> None:
-        """No-op: mock model is always \"loaded\"."""
         self._loaded = True
-        logger.info("MockVLMManager load() — no-op (stub mode)")
+        logger.info("MockVLMManager load() - no-op")
 
     def unload(self) -> None:
-        """No-op: no GPU memory to release."""
         self._loaded = False
         self.model = None
         self.processor = None
-        logger.info("MockVLMManager unload() — no-op (stub mode)")
+        logger.info("MockVLMManager unload() - no-op")
 
     def generate(
         self,
@@ -253,27 +281,12 @@ class MockVLMManager(VLMManager):
         prompt: str,
         max_tokens: int = 4096,
     ) -> str:
-        """Return a pre-canned mock response based on *prompt* content.
-
-        Detects structural vs value pass by keyword matching in the
-        prompt and returns the corresponding mock JSON.
-        """
         if not self._loaded:
             raise RuntimeError("Mock VLM not loaded. Call load() before generate().")
-
-        # Simulate inference latency for realism
         time.sleep(0.01)
-
         prompt_lower = prompt.lower()
         if "structural" in prompt_lower or "pass a" in prompt_lower:
-            logger.debug("MockVLMManager → returning structural map")
             return self._MOCK_STRUCTURAL_RESPONSE
-        elif "value" in prompt_lower or "pass b" in prompt_lower:
-            logger.debug("MockVLMManager → returning value map")
+        if "value" in prompt_lower or "pass b" in prompt_lower:
             return self._MOCK_VALUE_RESPONSE
-        else:
-            logger.debug("MockVLMManager → returning generic response")
-            return json.dumps(
-                {"status": "mock_response", "prompt_length": len(prompt)},
-                indent=2,
-            )
+        return json.dumps({"status": "mock_response", "prompt_length": len(prompt)}, indent=2)

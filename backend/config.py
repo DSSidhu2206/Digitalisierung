@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     APP_NAME: str = Field(default="Digitalisierung")
     DEBUG: bool = Field(default=False)
-    VLM_MODEL_ID: str = Field(default="mlx-community/Llama-3.2-11B-Vision-Instruct-4bit")
+    VLM_MODEL_ID: str = Field(default="surya-ocr")
     LLM_MODEL_PATH: str = Field(default="models/llama-3.1-8b-instruct.Q4_K_M.gguf")
     EMBEDDING_MODEL: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
     LLM_N_THREADS: int = Field(default=8)
@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     VLM_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
     LLM_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
     UPLOAD_DIR: str = Field(default="./uploads")
+    SURYA_DEVICE: str = Field(default="")
+    SURYA_DETECTOR_BATCH_SIZE: int = Field(default=12, ge=1)
+    SURYA_RECOGNITION_BATCH_SIZE: int = Field(default=96, ge=1)
+    SURYA_LAYOUT_BATCH_SIZE: int = Field(default=12, ge=1)
 
 
 # -- Module-level constants --
@@ -53,6 +57,15 @@ ALLOWED_IMAGE_TYPES: set[str] = {
     "image/tiff",
     "image/bmp",
     "application/pdf",
+    "text/plain",
+    "text/csv",
+    "text/tab-separated-values",
+    "text/markdown",
+    "text/html",
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 MAX_FILE_SIZE_BYTES: int = 50 * 1024 * 1024  # 50 MB
 

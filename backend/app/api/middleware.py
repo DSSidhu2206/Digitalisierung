@@ -226,7 +226,7 @@ def add_cors_middleware(app: FastAPI) -> None:
             "app://localhost",   # Flutter desktop (macOS)
             "null",              # file:// origin (dashboard opened locally)
         ],
-        allow_origin_regex=r"https?://localhost(:\d+)?",
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

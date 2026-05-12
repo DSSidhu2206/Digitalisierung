@@ -67,7 +67,12 @@ PASS B — VALUE EXTRACTION: Extract the actual values for each visible field.
 Output a JSON map of: field_name -> {raw_value, confidence_0_to_1}
 If text is blurry or ambiguous, mark confidence < 0.5."""
 
-    def extract(self, image_path: str, vlm: "VLMManager") -> DualPassResult:
+    def extract(
+        self,
+        image_path: str,
+        vlm: "VLMManager",
+        learned_context: str = "",
+    ) -> DualPassResult:
         """Run dual-pass extraction and cross-validate.
 
         Pipeline:
@@ -85,6 +90,8 @@ If text is blurry or ambiguous, mark confidence < 0.5."""
             vlm: A :class:`~app.vision.vlm_loader.VLMManager` or
                 :class:`~app.vision.vlm_loader.MockVLMManager`
                 instance.
+            learned_context: Optional few-shot examples retrieved from the
+                learned image corpus.
 
         Returns:
             :class:`DualPassResult` containing both maps and consistency
@@ -98,8 +105,26 @@ If text is blurry or ambiguous, mark confidence < 0.5."""
         if not vlm.is_loaded:
             vlm.load()
 
+        if getattr(vlm, "supports_direct_extraction", False):
+            try:
+                document = vlm.extract_document(image_path, with_layout=True)
+                result = self._from_document_extraction(document)
+                logger.info(
+                    "DualPassExtractor complete via direct Surya path - fields=%d consistency=%.2f",
+                    len(result.value_map),
+                    result.consistency_score,
+                )
+                return result
+            except Exception:
+                logger.exception(
+                    "Direct Surya extraction failed; falling back to prompt-compatible passes"
+                )
+
+        prompt_a = self._with_learned_context(self.PROMPT_PASS_A, learned_context)
+        prompt_b = self._with_learned_context(self.PROMPT_PASS_B, learned_context)
+
         logger.info("DualPassExtractor — Pass A (structural)")
-        raw_a = vlm.generate(image_path, self.PROMPT_PASS_A)
+        raw_a = vlm.generate(image_path, prompt_a)
         structural_map = self._parse_json_response(raw_a)
         logger.debug("Pass A returned %d fields", len(structural_map))
 
@@ -107,7 +132,7 @@ If text is blurry or ambiguous, mark confidence < 0.5."""
         # Pass B — value extraction
         # --------------------------------------------------------------
         logger.info("DualPassExtractor — Pass B (value extraction)")
-        raw_b = vlm.generate(image_path, self.PROMPT_PASS_B)
+        raw_b = vlm.generate(image_path, prompt_b)
         value_map = self._parse_json_response(raw_b)
         logger.debug("Pass B returned %d fields", len(value_map))
 
@@ -129,6 +154,100 @@ If text is blurry or ambiguous, mark confidence < 0.5."""
             value_map=value_map,
             consistency_score=consistency_score,
             contradictions=contradictions,
+        )
+
+    def _from_document_extraction(self, extraction: Any) -> DualPassResult:
+        """Convert normalized Surya OCR/layout output into dual-pass maps."""
+        structural_map: dict[str, dict[str, Any]] = {}
+        value_map: dict[str, dict[str, Any]] = {}
+        contradictions: list[str] = []
+
+        lines = list(getattr(extraction, "lines", []) or [])
+        engine = str(getattr(extraction, "engine", "surya") or "surya")
+        fallback_confidence = 0.85 if engine == "surya" else 0.55
+
+        for index, line in enumerate(lines, start=1):
+            text = " ".join(str(getattr(line, "text", "") or "").split())
+            if not text:
+                continue
+
+            key, value = self._split_line(text)
+            base_name = self._normalise_field_name(key or f"line_{index:04d}")
+            field_name = self._unique_field_name(structural_map, base_name)
+            confidence = self._coerce_confidence(
+                getattr(line, "confidence", fallback_confidence)
+            )
+            if confidence <= 0.0:
+                confidence = fallback_confidence
+
+            structural_map[field_name] = {
+                "label_text": key or f"OCR line {index}",
+                "field_type": self._infer_field_type(value or text),
+                "estimated_bbox": getattr(line, "bbox", None),
+                "engine": engine,
+            }
+            value_map[field_name] = {
+                "raw_value": value or text,
+                "confidence_0_to_1": confidence,
+                "engine": engine,
+            }
+            if confidence < 0.5:
+                contradictions.append(
+                    f"Field '{field_name}' has low confidence ({confidence:.2f})"
+                )
+
+        if not value_map:
+            text = str(getattr(extraction, "text", "") or "")
+            for index, text_line in enumerate(text.splitlines(), start=1):
+                cleaned = " ".join(text_line.strip().split())
+                if not cleaned:
+                    continue
+                field_name = self._unique_field_name(
+                    structural_map,
+                    self._normalise_field_name(f"line_{index:04d}"),
+                )
+                structural_map[field_name] = {
+                    "label_text": f"OCR line {index}",
+                    "field_type": self._infer_field_type(cleaned),
+                    "estimated_bbox": None,
+                    "engine": engine,
+                }
+                value_map[field_name] = {
+                    "raw_value": cleaned,
+                    "confidence_0_to_1": fallback_confidence,
+                    "engine": engine,
+                }
+
+        consistency_score, cross_contradictions = self._cross_validate(
+            structural_map,
+            value_map,
+        )
+        contradictions.extend(cross_contradictions)
+        if value_map:
+            avg_confidence = sum(
+                self._coerce_confidence(value.get("confidence_0_to_1", 0.0))
+                for value in value_map.values()
+                if isinstance(value, dict)
+            ) / max(len(value_map), 1)
+            consistency_score = min(consistency_score, max(0.0, avg_confidence))
+
+        return DualPassResult(
+            structural_map=structural_map,
+            value_map=value_map,
+            consistency_score=consistency_score,
+            contradictions=contradictions,
+        )
+
+    @staticmethod
+    def _with_learned_context(prompt: str, learned_context: str) -> str:
+        """Append retrieved learned image examples to a VLM prompt."""
+        if not learned_context.strip():
+            return prompt
+        return (
+            f"{prompt}\n\n"
+            f"{learned_context}\n\n"
+            "Use the learned examples only as recognition guidance for noisy "
+            "scans. Do not copy values from examples into this extraction."
         )
 
     # ------------------------------------------------------------------
@@ -267,3 +386,44 @@ If text is blurry or ambiguous, mark confidence < 0.5."""
 
         logger.warning("Could not parse VLM response as JSON: %s...", text[:200])
         return {}
+
+    @staticmethod
+    def _split_line(text: str) -> tuple[str, str]:
+        cleaned = " ".join(text.strip().split())
+        for separator in (":", "=", "|"):
+            if separator in cleaned:
+                key, value = cleaned.split(separator, 1)
+                key = key.strip()
+                value = value.strip()
+                if key and value:
+                    return key, value
+        return "", cleaned
+
+    @staticmethod
+    def _normalise_field_name(value: str) -> str:
+        field = "".join(ch.lower() if ch.isalnum() else "_" for ch in value.strip())
+        field = "_".join(part for part in field.split("_") if part)
+        if not field:
+            field = "field"
+        if field[0].isdigit():
+            field = f"field_{field}"
+        return field[:80]
+
+    @staticmethod
+    def _unique_field_name(existing: dict[str, Any], base: str) -> str:
+        candidate = base or "field"
+        suffix = 2
+        while candidate in existing:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    @staticmethod
+    def _infer_field_type(text: str) -> str:
+        stripped = text.strip()
+        digits = sum(ch.isdigit() for ch in stripped)
+        if digits >= 6 and any(ch in stripped for ch in (".", "/", "-")):
+            return "date"
+        if digits and digits >= max(1, len(stripped) // 2):
+            return "number"
+        return "text"

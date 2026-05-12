@@ -2,8 +2,11 @@
 
 import type { ChangeEvent, CSSProperties, DragEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
   Activity,
+  BarChart3,
+  Brain,
   Check,
   CircleCheck,
   CircleX,
@@ -14,17 +17,21 @@ import {
   LayoutDashboard,
   LoaderCircle,
   Pencil,
+  Play,
   RotateCcw,
   Search,
   Server,
   Settings,
   Shield,
+  Square,
   Trash2,
+  TrendingDown,
+  TrendingUp,
   Upload,
   X,
 } from 'lucide-react';
 
-type Page = 'dashboard' | 'upload' | 'review' | 'history' | 'settings';
+type Page = 'dashboard' | 'upload' | 'review' | 'history' | 'settings' | 'local';
 type UploadStatus = 'queued' | 'uploading' | 'done' | 'error';
 type HistoryFilter = 'all' | 'extracted' | 'unresolved' | 'corrected';
 
@@ -78,6 +85,50 @@ interface UploadJob {
   endTime: number | null;
 }
 
+interface LocalTrainingStatus {
+  state: string;
+  running: boolean;
+  pid?: number | null;
+  started_at?: number | null;
+  processed: number;
+  run_processed: number;
+  stored: number;
+  skipped: number;
+  pending_batch: number;
+  total_images: number;
+  progress_pct: number;
+  processed_progress_pct: number;
+  indexed_progress_pct: number;
+  images_per_second: number;
+  updated_at?: string | null;
+  updated_at_epoch?: number | null;
+  heartbeat_age_seconds?: number | null;
+  current_file?: string | null;
+  current_index?: number | null;
+  last_event?: string | null;
+  learning_score: number;
+  avg_quality_score: number;
+  avg_ocr_chars: number;
+  ocr_coverage_rate: number;
+  visual_hash_coverage_rate: number;
+  vector_index_enabled: boolean;
+  ocr_engine?: string;
+  ocr_batch_size?: number;
+  surya_device?: string;
+  surya_recognition_batch_size?: number;
+  surya_detector_batch_size?: number;
+  surya_task_name?: string;
+  top_labels: Record<string, number>;
+  recent_log: string[];
+}
+
+interface TrainingPoint {
+  time: number;
+  score: number;
+  processed: number;
+  stored: number;
+}
+
 const allowedTypes = new Set([
   'image/png',
   'image/jpeg',
@@ -85,21 +136,33 @@ const allowedTypes = new Set([
   'image/tiff',
   'image/bmp',
   'application/pdf',
+  'text/plain',
+  'text/csv',
+  'text/tab-separated-values',
+  'text/markdown',
+  'text/html',
+  'application/json',
+  'application/xml',
+  'text/xml',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 ]);
-const allowedExtensions = /\.(png|jpe?g|tiff?|bmp|pdf)$/i;
+const allowedExtensions = /\.(png|jpe?g|tiff?|bmp|pdf|txt|csv|tsv|md|json|xml|html?|docx)$/i;
 
 const navItems: Array<{ id: Page; label: string; Icon: typeof LayoutDashboard }> = [
   { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
   { id: 'upload', label: 'Upload', Icon: Upload },
   { id: 'review', label: 'Review', Icon: Search },
   { id: 'history', label: 'History', Icon: History },
+  { id: 'local', label: 'Local', Icon: Brain },
   { id: 'settings', label: 'Settings', Icon: Settings },
 ];
 
 const defaultApiUrl = () => {
-  if (typeof window === 'undefined') return 'http://localhost:8000';
-  return window.location.port === '3000' ? 'http://localhost:8000' : window.location.origin;
+  if (typeof window === 'undefined') return 'http://127.0.0.1:8000';
+  return window.location.port === '3000' ? 'http://127.0.0.1:8000' : window.location.origin;
 };
+
+const normalizeApiUrl = (value: string) => value.replace('http://localhost:8000', 'http://127.0.0.1:8000');
 
 function resultFields(result: ExtractionResult | null): [string, FieldResult][] {
   if (!result?.fields || typeof result.fields !== 'object') return [];
@@ -115,6 +178,14 @@ function formatSize(bytes: number): string {
 
 function formatDuration(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat('en-US').format(Math.round(value || 0));
+}
+
+function formatPercent(value: number, digits = 1): string {
+  return `${(clamp(value, 0, 1) * 100).toFixed(digits)}%`;
 }
 
 function formatDate(value?: string): string {
@@ -184,8 +255,9 @@ function bboxStyle(bbox: BoundingBox): CSSProperties {
   } as CSSProperties;
 }
 
-export function DashboardApp() {
-  const [page, setPage] = useState<Page>('upload');
+export function DashboardApp({ initialPage = 'upload' }: { initialPage?: Page }) {
+  const router = useRouter();
+  const [page, setPage] = useState<Page>(initialPage);
   const [apiUrl, setApiUrl] = useState(defaultApiUrl);
   const [settingsValue, setSettingsValue] = useState(defaultApiUrl);
   const [settingsSaved, setSettingsSaved] = useState(false);
@@ -216,10 +288,17 @@ export function DashboardApp() {
 
   useEffect(() => {
     const stored = window.localStorage.getItem('abe_api');
-    const resolved = stored || defaultApiUrl();
+    const resolved = normalizeApiUrl(stored || defaultApiUrl());
+    if (stored && stored !== resolved) {
+      window.localStorage.setItem('abe_api', resolved);
+    }
     setApiUrl(resolved);
     setSettingsValue(resolved);
   }, []);
+
+  useEffect(() => {
+    setPage(initialPage);
+  }, [initialPage]);
 
   useEffect(() => {
     jobsRef.current = uploadJobs;
@@ -490,6 +569,11 @@ export function DashboardApp() {
   const navigate = (nextPage: Page) => {
     setSettingsSaved(false);
     setPage(nextPage);
+    if (nextPage === 'local') {
+      router.push('/dashboard/local');
+    } else if (page === 'local') {
+      router.push('/dashboard');
+    }
   };
 
   return (
@@ -521,6 +605,8 @@ export function DashboardApp() {
           <DashboardPage extractionHistory={extractionHistory} onOpenReview={openReview} onNavigate={navigate} />
         )}
 
+        {page === 'local' && <LocalTrainingPage apiUrl={apiUrl} />}
+
         {page === 'upload' && (
           <section className="page narrow">
             <div className="page-header">
@@ -550,7 +636,7 @@ export function DashboardApp() {
                 ref={fileInputRef}
                 className="sr-only"
                 type="file"
-                accept="image/png,image/jpeg,image/jpg,image/tiff,image/bmp,application/pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.pdf"
+                accept="image/png,image/jpeg,image/jpg,image/tiff,image/bmp,application/pdf,text/plain,text/csv,text/tab-separated-values,text/markdown,text/html,application/json,application/xml,text/xml,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.pdf,.txt,.csv,.tsv,.md,.json,.xml,.html,.htm,.docx"
                 multiple
                 onChange={handleFileInputChange}
               />
@@ -613,7 +699,7 @@ export function DashboardApp() {
               setSettingsSaved(true);
             }}
             onSave={() => {
-              const normalized = settingsValue.replace(/\/$/, '');
+              const normalized = normalizeApiUrl(settingsValue.replace(/\/$/, ''));
               setApiUrl(normalized);
               setSettingsValue(normalized);
               window.localStorage.setItem('abe_api', normalized);
@@ -655,7 +741,10 @@ function DashboardPage({
           <h2 className="page-title">Dashboard</h2>
           <p className="page-copy">Operational overview for local document extraction.</p>
         </div>
-        <button className="primary-button" onClick={() => onNavigate('upload')} type="button"><Upload size={17} /> Upload</button>
+        <div className="header-actions">
+          <button className="ghost-button" onClick={() => onNavigate('local')} type="button"><Brain size={17} /> Switch to local</button>
+          <button className="primary-button" onClick={() => onNavigate('upload')} type="button"><Upload size={17} /> Upload</button>
+        </div>
       </div>
       <div className="grid stats">
         {cards.map(({ label, value, Icon }) => (
@@ -676,6 +765,235 @@ function DashboardPage({
         ) : (
           <div className="rows">{extractionHistory.slice(0, 8).map((item) => <RecentRow key={item.metadata.extraction_id} item={item} onOpenReview={onOpenReview} />)}</div>
         )}
+      </div>
+    </section>
+  );
+}
+
+function LocalTrainingPage({ apiUrl }: { apiUrl: string }) {
+  const [status, setStatus] = useState<LocalTrainingStatus | null>(null);
+  const [points, setPoints] = useState<TrainingPoint[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [autoRefresh, setAutoRefresh] = useState(true);
+
+  const endpoint = apiUrl.replace(/\/$/, '');
+
+  const fetchStatus = useCallback(async () => {
+    try {
+      const response = await fetch(`${endpoint}/api/v1/local-training/status`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const next = (await response.json()) as LocalTrainingStatus;
+      setStatus(next);
+      setError('');
+      setPoints((history) => {
+        const point = {
+          time: Date.now(),
+          score: next.learning_score || 0,
+          processed: next.processed || 0,
+          stored: next.stored || 0,
+        };
+        const last = history[history.length - 1];
+        if (last && last.processed === point.processed && last.score === point.score) return history;
+        return [...history.slice(-47), point];
+      });
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Status request failed');
+    }
+  }, [endpoint]);
+
+  useEffect(() => {
+    void fetchStatus();
+  }, [fetchStatus]);
+
+  useEffect(() => {
+    if (!autoRefresh) return undefined;
+    const timer = window.setInterval(() => {
+      void fetchStatus();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, fetchStatus]);
+
+  const mutateTraining = async (action: 'start' | 'stop') => {
+    setBusy(true);
+    setError('');
+    try {
+      const response = await fetch(`${endpoint}/api/v1/local-training/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: action === 'start' ? JSON.stringify({ batch_size: 32, max_seconds: 3300, plateau_window: 50000, heartbeat_seconds: 1 }) : undefined,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const next = (await response.json()) as LocalTrainingStatus;
+      setStatus(next);
+      await fetchStatus();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : `${action} failed`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const current = status;
+  const previousPoint = points.length > 1 ? points[points.length - 2] : null;
+  const latestPoint = points[points.length - 1] || null;
+  const scoreDelta = latestPoint && previousPoint ? latestPoint.score - previousPoint.score : 0;
+  const processedCoverage = current?.total_images ? current.processed / current.total_images : 0;
+  const indexedCoverage = current?.total_images ? current.stored / current.total_images : 0;
+  const remaining = current ? Math.max(current.total_images - current.processed, 0) : 0;
+  const etaSeconds = current?.images_per_second ? remaining / current.images_per_second : 0;
+  const statusTone = current?.running ? 'green' : current?.state === 'stopped' ? 'amber' : 'blue';
+  const topLabels = Object.entries(current?.top_labels || {}).slice(0, 6);
+  const heartbeatAge = current?.heartbeat_age_seconds;
+  const heartbeatLabel = heartbeatAge === null || heartbeatAge === undefined ? '--' : `${heartbeatAge.toFixed(1)}s ago`;
+
+  const scoreCards = [
+    { label: 'Learning Score', value: current ? current.learning_score.toFixed(1) : '--', Icon: BarChart3 },
+    { label: 'Processed Coverage', value: current ? `${(current.processed_progress_pct ?? processedCoverage * 100).toFixed(2)}%` : '--', Icon: Database },
+    { label: 'Learned Images', value: current ? formatNumber(current.stored) : '--', Icon: FileText },
+    { label: 'Throughput', value: current ? `${current.images_per_second.toFixed(2)}/s` : '--', Icon: Activity },
+  ];
+
+  const metricRows = current
+    ? [
+        ['Total images', formatNumber(current.total_images)],
+        ['Processed', formatNumber(current.processed)],
+        ['This run', formatNumber(current.run_processed || 0)],
+        ['Stored', formatNumber(current.stored)],
+        ['Pending batch', formatNumber(current.pending_batch || 0)],
+        ['Skipped', formatNumber(current.skipped)],
+        ['Current file', current.current_file || '--'],
+        ['Current index', current.current_index ? formatNumber(current.current_index) : '--'],
+        ['Last event', current.last_event || '--'],
+        ['Heartbeat', heartbeatLabel],
+        ['Indexed coverage', `${(current.indexed_progress_pct ?? indexedCoverage * 100).toFixed(2)}%`],
+        ['Average quality', formatPercent(current.avg_quality_score)],
+        ['OCR coverage', formatPercent(current.ocr_coverage_rate)],
+        ['Average OCR characters', current.avg_ocr_chars.toFixed(1)],
+        ['OCR engine', current.ocr_engine || 'surya-ocr'],
+        ['Surya device', current.surya_device || 'auto'],
+        ['Surya task', current.surya_task_name || 'ocr_without_boxes'],
+        ['OCR batch', `${current.ocr_batch_size || 32}`],
+        ['Surya batch', `${current.surya_recognition_batch_size || 32}/${current.surya_detector_batch_size || 4}`],
+        ['Visual hash coverage', formatPercent(current.visual_hash_coverage_rate)],
+        ['Vector index', current.vector_index_enabled ? 'Enabled' : 'Fallback'],
+        ['ETA at current rate', etaSeconds ? formatDuration(etaSeconds * 1000) : '--'],
+      ]
+    : [];
+
+  return (
+    <section className="page local-page">
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">Local Image Learning</h2>
+          <p className="page-copy">RVL-CDIP image learning workspace.</p>
+        </div>
+        <div className="header-actions">
+          <button className="ghost-button" onClick={() => setAutoRefresh((value) => !value)} type="button">
+            <Activity size={17} /> {autoRefresh ? 'Live' : 'Paused'}
+          </button>
+          <button className="ghost-button" disabled={busy || !current?.running} onClick={() => void mutateTraining('stop')} type="button">
+            <Square size={15} /> Stop
+          </button>
+          <button className="primary-button" disabled={busy || current?.running} onClick={() => void mutateTraining('start')} type="button">
+            <Play size={17} /> Start local training
+          </button>
+        </div>
+      </div>
+
+      <div className="training-hero">
+        <div>
+          <div className="training-status-line">
+            <span className={`badge ${statusTone}`}>{current?.state || 'loading'}</span>
+            <span className="job-meta">{current?.updated_at || 'No progress file yet'}</span>
+            <span className="job-meta">{current?.last_event || 'waiting'}</span>
+          </div>
+          <div className="training-score-row">
+            <span className="training-score">{current ? current.learning_score.toFixed(1) : '--'}</span>
+            <span className={`score-delta ${scoreDelta >= 0 ? 'up' : 'down'}`}>
+              {scoreDelta >= 0 ? <TrendingUp size={17} /> : <TrendingDown size={17} />}
+              {scoreDelta === 0 ? '0.0' : `${scoreDelta > 0 ? '+' : ''}${scoreDelta.toFixed(2)}`}
+            </span>
+          </div>
+          <div className="wide-progress">
+            <span style={{ '--progress': `${clamp(processedCoverage * 100, 0, 100)}%` } as CSSProperties} />
+          </div>
+          <div className="training-live-row">
+            <span>Processing</span>
+            <strong className="mono">{current?.current_file || '--'}</strong>
+          </div>
+        </div>
+        <div className="training-summary">
+          <span className="label">Managed PID</span>
+          <strong className="mono">{current?.pid || '--'}</strong>
+          <span className="label">Remaining to scan</span>
+          <strong className="mono">{formatNumber(remaining)}</strong>
+          <span className="label">Indexed</span>
+          <strong className="mono">{current ? `${(current.indexed_progress_pct ?? indexedCoverage * 100).toFixed(2)}%` : '--'}</strong>
+        </div>
+      </div>
+
+      {error && <div className="job-error">{error}</div>}
+
+      <div className="grid stats">
+        {scoreCards.map(({ label, value, Icon }) => (
+          <div className="stat-card" key={label}>
+            <div className="stat-top"><div className="icon-box"><Icon size={18} /></div><p className="stat-value">{value}</p></div>
+            <p className="stat-label">{label}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="local-grid">
+        <div className="panel">
+          <div className="panel-header"><h3 className="panel-title">Learning Trend</h3><span className="fine">{points.length} samples</span></div>
+          <div className="trend-chart">
+            {points.length === 0 ? (
+              <div className="empty-state"><p>No live samples yet.</p></div>
+            ) : (
+              points.map((point) => (
+                <span
+                  key={`${point.time}-${point.processed}`}
+                  title={`${point.score.toFixed(1)} at ${formatNumber(point.stored)} images`}
+                  style={{ '--bar': `${clamp(point.score, 4, 100)}%` } as CSSProperties}
+                />
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-header"><h3 className="panel-title">Stats Sheet</h3><span className="fine">live</span></div>
+          <div className="metrics-table">
+            {metricRows.map(([name, value]) => (
+              <div className="metric-row" key={name}>
+                <span>{name}</span>
+                <strong className="mono">{value}</strong>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-header"><h3 className="panel-title">Corpus Mix</h3><span className="fine">{topLabels.length} labels</span></div>
+          <div className="label-stack">
+            {topLabels.length === 0 ? (
+              <div className="empty-state compact"><p>No labels indexed.</p></div>
+            ) : (
+              topLabels.map(([label, count]) => (
+                <div className="label-row" key={label}>
+                  <span>{label}</span>
+                  <span className="mono">{formatNumber(count)}</span>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="panel log-panel">
+          <div className="panel-header"><h3 className="panel-title">Training Log</h3><button className="link-button" onClick={() => void fetchStatus()} type="button">Refresh</button></div>
+          <pre className="log-stream">{(current?.recent_log || []).slice(-22).join('\n') || 'Waiting for local training output.'}</pre>
+        </div>
       </div>
     </section>
   );
@@ -1014,7 +1332,7 @@ function SettingsPage({
   saved: boolean;
 }) {
   const models = [
-    ['Vision Model', 'Llama-3.2-11B-Vision-Instruct-4bit', 'Local MLX runtime'],
+    ['Vision Model', 'Surya OCR 0.17.1', 'Local neural OCR/layout runtime'],
     ['Logic Model', 'Llama-3.1-8B-Instruct-Q4_K_M', 'Local GGUF runtime'],
     ['Embeddings', 'all-MiniLM-L6-v2', 'Local ChromaDB retrieval'],
   ];
