@@ -204,6 +204,7 @@ frontend/tsconfig.tsbuildinfo
 backend/models/
 models/
 documents/
+data/
 *.tar
 *.tar.gz
 # --- RVL-CDIP dataset ---
