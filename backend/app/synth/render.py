@@ -15,7 +15,9 @@ degradations in ``augment.py`` this gives wide, transfer-useful variety.
 """
 from __future__ import annotations
 
+import glob
 import math
+import os
 import random
 from functools import lru_cache
 
@@ -23,10 +25,39 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from app.models.enums import DocumentType
 
-_FD = "/System/Library/Fonts/Supplemental"
-_SANS = [f"{_FD}/Arial.ttf", "/System/Library/Fonts/Helvetica.ttc"]
-_SERIF = [f"{_FD}/Times New Roman.ttf"]
-_MONO = [f"{_FD}/Courier New.ttf"]
+# Cross-platform fonts: macOS first, then common Linux fonts (DejaVu/Liberation
+# — present on Ubuntu/Kaggle), then any discovered .ttf, then PIL's default.
+_MAC = "/System/Library/Fonts/Supplemental"
+_DEJAVU = "/usr/share/fonts/truetype/dejavu"
+_LIBER = "/usr/share/fonts/truetype/liberation"
+
+
+def _existing(paths: list[str]) -> list[str]:
+    return [p for p in paths if os.path.isfile(p)]
+
+
+def _discover_any_ttf():
+    for pattern in ("/usr/share/fonts/**/*.ttf", "/usr/local/share/fonts/**/*.ttf",
+                    os.path.expanduser("~/.fonts/**/*.ttf"), "/Library/Fonts/*.ttf",
+                    f"{_MAC}/*.ttf"):
+        hits = glob.glob(pattern, recursive=True)
+        if hits:
+            return hits[0]
+    return None
+
+
+_SANS = _existing([f"{_MAC}/Arial.ttf", "/System/Library/Fonts/Helvetica.ttc",
+                   f"{_DEJAVU}/DejaVuSans.ttf", f"{_LIBER}/LiberationSans-Regular.ttf"])
+_SERIF = _existing([f"{_MAC}/Times New Roman.ttf", f"{_DEJAVU}/DejaVuSerif.ttf",
+                    f"{_LIBER}/LiberationSerif-Regular.ttf"])
+_MONO = _existing([f"{_MAC}/Courier New.ttf", f"{_DEJAVU}/DejaVuSansMono.ttf",
+                   f"{_LIBER}/LiberationMono-Regular.ttf"])
+
+if not _SANS:                          # unknown platform — discover, else PIL default
+    found = _discover_any_ttf()
+    _SANS = [found] if found else [None]
+_SERIF = _SERIF or _SANS
+_MONO = _MONO or _SANS
 _FALLBACK = _SANS[0]
 
 # Label phrasing variants per canonical field (the *value* is the training
@@ -59,11 +90,14 @@ _LABELS = {
 
 
 @lru_cache(maxsize=512)
-def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
-        return ImageFont.truetype(_FALLBACK, size)
+def _font(path, size: int):
+    for candidate in (path, _FALLBACK):
+        if candidate:
+            try:
+                return ImageFont.truetype(candidate, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
 
 
 class _Style:
