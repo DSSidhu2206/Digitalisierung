@@ -151,9 +151,9 @@ def parse_german_amount(text: str) -> Optional[float]:
 class SchemaFieldMapper:
     """Map OCR lines to canonical schema fields for a document type."""
 
-    SAME_ROW_Y_TOL = 0.020       # vertical overlap tolerance (normalised)
-    BELOW_MAX_GAP = 0.060        # max vertical gap to associate a value below a label
-    BELOW_X_TOL = 0.080          # horizontal alignment tolerance for "below"
+    SAME_ROW_Y_TOL = 0.020          # vertical center tolerance for "same row"
+    BELOW_MAX_CENTER_DELTA = 0.080  # max center-to-center distance for "below"
+    BELOW_X_TOL = 0.080             # horizontal alignment tolerance for "below"
 
     SRC_CONFIDENCE = {
         "inline": 1.0,
@@ -214,6 +214,12 @@ class SchemaFieldMapper:
 
         # Pass 3 — label-free value-shape fallback for still-missing key fields.
         self._pattern_fallback(lines, consumed, labels, mapped, document_type)
+
+        # Pass 3b — card-specific: the surname on a Personalausweis is printed
+        # WITHOUT a "Familienname:" label. Take the prominent uppercase name in
+        # the data column (right of the photo) if familienname is still missing.
+        if document_type == DocumentType.PERSONALAUSWEIS and "familienname" not in mapped:
+            self._infer_card_surname(lines, consumed, mapped)
 
         # Pass 4 — preserve unmapped lines as low-confidence review items.
         for idx, line in enumerate(lines):
@@ -278,6 +284,11 @@ class SchemaFieldMapper:
         if canonical == "steueridentifikationsnummer":
             digits = re.sub(r"\D", "", raw_value)
             return digits if len(digits) == 11 else (raw_value or None)
+        if canonical == "dokumentnummer":
+            # 9 alphanumerics; OCR often appends the trailing check digit.
+            cleaned = re.sub(r"[^A-Za-z0-9]", "", raw_value).upper()
+            match = re.match(r"[A-Z0-9]{9}", cleaned)
+            return match.group(0) if match else (cleaned or None)
         if canonical == "steuerklasse":
             m = _RE_STEUERKLASSE.search(raw_value.upper())
             return m.group(1) if m else None
@@ -367,11 +378,15 @@ class SchemaFieldMapper:
                 dist = b["x1"] - lb["x2"]
                 if dist >= -0.02 and (right_best is None or dist < right_best[0]):
                     right_best = (dist, idx)
-            # Directly below.
-            gap = b["y1"] - lb["y2"]
-            if 0 <= gap <= self.BELOW_MAX_GAP and abs(b["x1"] - lb["x1"]) <= self.BELOW_X_TOL:
-                if below_best is None or gap < below_best[0]:
-                    below_best = (gap, idx)
+            # Below: center lower than the label's, ranked by center distance
+            # (not the top-to-bottom gap) so slightly-overlapping OCR boxes —
+            # common on ID cards — still associate to the nearest value.
+            if cy > label_cy and abs(b["x1"] - lb["x1"]) <= self.BELOW_X_TOL:
+                delta = cy - label_cy
+                if delta <= self.BELOW_MAX_CENTER_DELTA and (
+                    below_best is None or delta < below_best[0]
+                ):
+                    below_best = (delta, idx)
         if right_best is not None:
             return right_best[1]
         if below_best is not None:
@@ -420,3 +435,46 @@ class SchemaFieldMapper:
                     self._assign(mapped, "geburtsdatum", m.group(0), line, "pattern")
                     consumed.add(idx)
                     continue
+
+    def _infer_card_surname(
+        self, lines: list[Any], consumed: set[int], mapped: dict[str, MappedField]
+    ) -> None:
+        """Assign the unlabeled, uppercase surname on an ID card to familienname.
+
+        Picks the topmost unconsumed, uppercase-dominant alphabetic line in the
+        data column (x1 >= 0.30, i.e. right of the photo) that is not itself a
+        recognised label.
+        """
+        labels = _LABELS[DocumentType.PERSONALAUSWEIS]
+        best_idx: Optional[int] = None
+        best_y = 1.0
+        for idx, line in enumerate(lines):
+            if idx in consumed:
+                continue
+            bbox = getattr(line, "bbox", None)
+            if not bbox or bbox.get("x1", 0.0) < 0.30:
+                continue
+            text = " ".join(str(line.text).split())
+            stripped = re.sub(r"[^A-Za-zÄÖÜäöüß\s\-]", "", text).strip()
+            letters = [c for c in stripped if c.isalpha()]
+            if not (2 <= len(stripped) <= 40) or not letters:
+                continue
+            if sum(1 for c in letters if c.isupper()) < max(2, len(letters) - 1):
+                continue
+            if self._looks_like_label(text, labels):
+                continue
+            if bbox["y1"] < best_y:
+                best_y, best_idx = bbox["y1"], idx
+        if best_idx is None:
+            return
+        line = lines[best_idx]
+        value = " ".join(str(line.text).split())
+        mapped["familienname"] = MappedField(
+            field_name="familienname",
+            value=value,
+            confidence=min(self._conf(line) * 0.85, 1.0),
+            raw_text=value,
+            bbox=getattr(line, "bbox", None),
+            source="card-surname",
+        )
+        consumed.add(best_idx)

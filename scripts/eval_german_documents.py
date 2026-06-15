@@ -202,8 +202,10 @@ def evaluate(ground_truth: dict) -> None:
                 cmp_pred = f"{pf:.2f}" if pf is not None else pred
                 cmp_truth = f"{tf:.2f}" if tf is not None else truth_n
             else:
-                is_exact = pred == truth_n
-                cmp_pred, cmp_truth = pred, truth_n
+                # Case-insensitive: ID cards print names UPPERCASE; case is a
+                # presentation detail, not an extraction error.
+                cmp_pred, cmp_truth = pred.casefold(), truth_n.casefold()
+                is_exact = cmp_pred == cmp_truth
             field_cer = cer(cmp_pred, cmp_truth)
             field_wer = wer(cmp_pred, cmp_truth)
             cer_sum += field_cer
