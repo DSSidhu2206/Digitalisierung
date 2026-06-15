@@ -1,0 +1,47 @@
+{
+  "_README": "Ground truth transcribed by visually reading each image. Blank fields are skipped by the eval. Amounts are compared numerically.",
+  "01_meldebescheinigung_coffee_stain.png": {
+    "document_type": "Meldebescheinigung",
+    "fields": {
+      "familienname": "Müller",
+      "vorname": "Hans",
+      "geburtsdatum": "15.03.1985",
+      "geburtsort": "Hamburg",
+      "staatsangehoerigkeit": "Deutsch",
+      "strasse": "Hauptstraße",
+      "hausnummer": "42",
+      "postleitzahl": "10115",
+      "wohnort": "Berlin"
+    }
+  },
+  "02_steuerbescheid_skewed.png": {
+    "document_type": "Steuerbescheid",
+    "fields": {
+      "steueridentifikationsnummer": "04452397667",
+      "veranlagungszeitraum": "2024",
+      "zu_versteuerndes_einkommen": "45236,00",
+      "festgesetzte_steuer": "8947,00"
+    }
+  },
+  "03_personalausweis_photocopy.png": {
+    "document_type": "Personalausweis",
+    "fields": {
+      "dokumentnummer": "T22000129",
+      "familienname": "Müller",
+      "vorname": "Hans",
+      "geburtsdatum": "15.03.1985",
+      "geburtsort": "",
+      "staatsangehoerigkeit": "",
+      "gueltig_bis": "01.09.2030"
+    }
+  },
+  "04_gehaltsausweis_handwritten_note.png": {
+    "document_type": "Gehaltsausweis",
+    "fields": {
+      "arbeitgeber": "Muster GmbH",
+      "brutto_lohn": "4850,00",
+      "netto_lohn": "",
+      "abrechnungszeitraum": ""
+    }
+  }
+}

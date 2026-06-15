@@ -23,12 +23,23 @@ class Settings(BaseSettings):
 
     APP_NAME: str = Field(default="Digitalisierung")
     DEBUG: bool = Field(default=False)
+    # Network binding — localhost only by default (no LAN exposure of PII).
+    HOST: str = Field(default="127.0.0.1")
+    PORT: int = Field(default=8000, ge=1, le=65535)
+    # Optional API key for mutating/expensive endpoints. Empty = disabled,
+    # which is safe because the server binds to localhost by default.
+    API_KEY: str = Field(default="")
     VLM_MODEL_ID: str = Field(default="surya-ocr")
     LLM_MODEL_PATH: str = Field(default="models/llama-3.1-8b-instruct.Q4_K_M.gguf")
     EMBEDDING_MODEL: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
     LLM_N_THREADS: int = Field(default=8)
     LLM_N_BATCH: int = Field(default=512)
     LLM_N_CTX: int = Field(default=8192)
+    # -1 offloads all transformer layers to the Apple Metal GPU (llama.cpp).
+    LLM_N_GPU_LAYERS: int = Field(default=-1)
+    # Optional local-LLM structuring to fill OCR-missed fields. Off by default;
+    # requires a GGUF model on disk + llama-cpp-python. Never fabricates values.
+    ENABLE_LLM_STRUCTURING: bool = Field(default=False)
     RAM_THRESHOLD: float = Field(default=0.80, ge=0.0, le=1.0)
     MAX_CONCURRENT_REQUESTS: int = Field(default=1, ge=1)
     LEGIBILITY_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0)

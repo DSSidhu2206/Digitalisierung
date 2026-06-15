@@ -38,16 +38,16 @@ from app.validators.german_validators import GermanDateValidator, GermanStreetVa
 
 regex_patterns: dict[str, str] = {
     # Personal data
-    "familienname": r"^[A-Za-zÄÖÜäöüß\-\\s']{2,100}$",
-    "vorname": r"^[A-Za-zÄÖÜäöüß\-\\s']{2,100}$",
-    "geburtsort": r"^[A-Za-zÄÖÜäöüß\-\\s().]{2,100}$",
-    "staatsangehoerigkeit": r"^[A-Za-zÄÖÜäöüß\-\\s]{2,100}$",
+    "familienname": r"^[A-Za-zÄÖÜäöüß\-\s']{2,100}$",
+    "vorname": r"^[A-Za-zÄÖÜäöüß\-\s']{2,100}$",
+    "geburtsort": r"^[A-Za-zÄÖÜäöüß\-\s().]{2,100}$",
+    "staatsangehoerigkeit": r"^[A-Za-zÄÖÜäöüß\-\s]{2,100}$",
     # Address fields
-    "strasse": r"^[A-Za-zÄÖÜäöüß0-9\-\\s./]{2,100}$",
+    "strasse": r"^[A-Za-zÄÖÜäöüß0-9\-\s./]{2,100}$",
     "hausnummer": r"^[0-9]{1,4}[a-zA-Z]?$",
     "postleitzahl": r"^\d{5}$",
-    "wohnort": r"^[A-Za-zÄÖÜäöüß\-\\s]{2,100}$",
-    "vorherige_anschrift": r"^[A-Za-zÄÖÜäöüß0-9\-\\s.,/]{5,200}$",
+    "wohnort": r"^[A-Za-zÄÖÜäöüß\-\s]{2,100}$",
+    "vorherige_anschrift": r"^[A-Za-zÄÖÜäöüß0-9\-\s.,/]{5,200}$",
     # Document-specific identifiers
     "steueridentifikationsnummer": r"^\d{11}$",
     "dokumentnummer": r"^[A-Z0-9]{9}$",
@@ -57,8 +57,8 @@ regex_patterns: dict[str, str] = {
     "steuerklasse": r"^(I|II|III|IV|V|VI)$",
     "sozialversicherungsnummer": r"^\d{12}$",
     # Generic
-    "arbeitgeber": r"^[A-Za-zÄÖÜäöüß0-9\-\\s&.,()]{2,200}$",
-    "ausstellende_behoerde": r"^[A-Za-zÄÖÜäöüß0-9\-\\s.,()]{2,200}$",
+    "arbeitgeber": r"^[A-Za-zÄÖÜäöüß0-9\-\s&.,()]{2,200}$",
+    "ausstellende_behoerde": r"^[A-Za-zÄÖÜäöüß0-9\-\s.,()]{2,200}$",
 }
 """Mapping of field-name → regex pattern.
 

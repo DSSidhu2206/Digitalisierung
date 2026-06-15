@@ -105,10 +105,38 @@ class FileTextExtractor:
             logger.warning("PDF text extraction failed for %s: %s", path, exc)
             return self._read_text(path)
 
+    # Hard cap on decompressed document.xml to defuse zip/decompression bombs.
+    _MAX_DOCX_XML_BYTES = 50 * 1024 * 1024  # 50 MB
+
     def _extract_docx(self, path: Path) -> str:
         try:
             with zipfile.ZipFile(path) as archive:
-                xml = archive.read("word/document.xml").decode("utf-8", errors="ignore")
+                try:
+                    info = archive.getinfo("word/document.xml")
+                except KeyError:
+                    return self._read_text(path)
+                # Advisory pre-checks on the declared sizes (cheap, spoofable).
+                if info.file_size > self._MAX_DOCX_XML_BYTES:
+                    logger.warning(
+                        "DOCX document.xml declares %d bytes (> cap); refusing %s",
+                        info.file_size,
+                        path,
+                    )
+                    return ""
+                if info.compress_size > 0 and (info.file_size / info.compress_size) > 200:
+                    logger.warning(
+                        "DOCX compression ratio %.0fx too high; refusing %s",
+                        info.file_size / max(info.compress_size, 1),
+                        path,
+                    )
+                    return ""
+                # Hard guard: bounded read never decompresses past the cap.
+                with archive.open("word/document.xml") as member:
+                    raw = member.read(self._MAX_DOCX_XML_BYTES + 1)
+                if len(raw) > self._MAX_DOCX_XML_BYTES:
+                    logger.warning("DOCX document.xml exceeded cap; truncating %s", path)
+                    raw = raw[: self._MAX_DOCX_XML_BYTES]
+                xml = raw.decode("utf-8", errors="ignore")
             text = re.sub(r"<[^>]+>", " ", xml)
             return re.sub(r"\s+", " ", text).strip()
         except Exception as exc:

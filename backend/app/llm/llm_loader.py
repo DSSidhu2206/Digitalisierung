@@ -23,6 +23,7 @@ try:
 
     _LLAMA_CPP_AVAILABLE = True
 except ImportError:
+    Llama = None  # type: ignore[assignment,misc]
     _LLAMA_CPP_AVAILABLE = False
     logger.warning(
         "llama_cpp not available — LLMManager will fall back to MockLLMManager. "
@@ -53,11 +54,12 @@ class LLMManager:
     def load(self) -> None:
         """Load the GGUF model into RAM.
 
-        M4-optimised settings:
-        - n_ctx=8192  … context window
-        - n_threads=8 … Apple Silicon performance cores
-        - n_batch=512 … prompt processing batch size
-        - verbose=False … suppress llama.cpp stderr spam
+        Apple-Silicon-optimised settings:
+        - n_ctx=8192       … context window
+        - n_threads=8      … Apple Silicon performance cores
+        - n_batch=512      … prompt processing batch size
+        - n_gpu_layers=-1  … offload ALL transformer layers to the Metal GPU
+        - verbose=False    … suppress llama.cpp stderr spam
 
         Raises:
             RuntimeError: If llama_cpp is not installed or model file is missing.
@@ -68,16 +70,38 @@ class LLMManager:
                 "`pip install llama-cpp-python`"
             )
 
-        resolved = os.path.join(os.getcwd(), self.MODEL_PATH)
-        if not os.path.isfile(resolved):
-            raise RuntimeError(f"GGUF model not found at {resolved}")
+        # Prefer the configured model path; fall back to the legacy constant.
+        n_gpu_layers = -1
+        configured_path: Optional[str] = None
+        try:
+            from config import get_settings
 
-        logger.info("Loading GGUF model from %s …", resolved)
+            settings = get_settings()
+            n_gpu_layers = int(getattr(settings, "LLM_N_GPU_LAYERS", -1))
+            configured_path = getattr(settings, "LLM_MODEL_PATH", None)
+        except Exception:
+            pass
+
+        resolved = None
+        for candidate in (configured_path, self.MODEL_PATH):
+            if not candidate:
+                continue
+            path = candidate if os.path.isabs(candidate) else os.path.join(os.getcwd(), candidate)
+            if os.path.isfile(path):
+                resolved = path
+                break
+        if resolved is None:
+            raise RuntimeError(
+                f"GGUF model not found (looked for {configured_path!r}, {self.MODEL_PATH!r})"
+            )
+
+        logger.info("Loading GGUF model from %s (n_gpu_layers=%s, Metal) …", resolved, n_gpu_layers)
         self.llm = Llama(
             model_path=resolved,
             n_ctx=8192,
             n_threads=8,
             n_batch=512,
+            n_gpu_layers=n_gpu_layers,
             verbose=False,
         )
         self._loaded = True

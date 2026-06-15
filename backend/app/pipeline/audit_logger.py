@@ -39,8 +39,8 @@ class AuditLogger:
         Args:
             log_path: Path to the JSONL audit log file.  The parent
                 directory is created automatically if it does not exist.
-            rotate_size_mb: Size threshold (MB) for log rotation (stub).
-            max_archives: Maximum number of archived log files (stub).
+            rotate_size_mb: Size threshold (MB) that triggers log rotation.
+            max_archives: Maximum number of gzip archives to retain.
         """
         self._log_path: str = log_path
         self.rotate_size_mb = rotate_size_mb
@@ -75,8 +75,21 @@ class AuditLogger:
             with open(self._log_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             logger.info("Audit logged: extraction_id=%s", result.metadata.extraction_id)
+            self._maybe_rotate()
         except Exception as exc:
             logger.error("Failed to write audit log: %s", exc)
+
+    def _maybe_rotate(self) -> None:
+        """Rotate the log when it grows past the configured size threshold."""
+        try:
+            size_mb = os.path.getsize(self._log_path) / (1024 * 1024)
+        except OSError:
+            return
+        if size_mb >= self.rotate_size_mb:
+            try:
+                self.rotate_logs()
+            except Exception as exc:
+                logger.error("Audit log rotation failed: %s", exc)
 
     def get_history(
         self,
@@ -259,6 +272,15 @@ class AuditLogger:
         # Truncate the active log
         with open(self._log_path, "w", encoding="utf-8"):
             pass
+
+        # Prune the oldest archives beyond max_archives.
+        archives = sorted(archive_dir.glob("audit_*.jsonl.gz"))
+        excess = len(archives) - self.max_archives
+        for old in archives[: max(0, excess)]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
         logger.info("Rotated audit log to %s", archive_path)
 

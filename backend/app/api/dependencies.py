@@ -11,12 +11,13 @@ Spec: Section 10 — API Layer (Dependencies)
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 from functools import lru_cache
 from typing import Any, Optional
 
-from fastapi import Depends, File, HTTPException, UploadFile, status
+from fastapi import Depends, File, Header, HTTPException, UploadFile, status
 
 from config import ALLOWED_IMAGE_TYPES, MAX_FILE_SIZE_BYTES
 from app.database.chroma_manager import ChromaManager
@@ -86,8 +87,60 @@ def get_chroma_manager() -> ChromaManager:
 
 
 # ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+
+async def require_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> None:
+    """Require a valid API key on mutating / expensive endpoints.
+
+    No-op when ``API_KEY`` is unset — the server binds to localhost by
+    default, so this is defense-in-depth, not the primary control. When a key
+    is configured it is compared in constant time.
+    """
+    from config import get_settings
+
+    expected = (get_settings().API_KEY or "").strip()
+    if not expected:
+        return
+    provided = (x_api_key or "").strip()
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key.",
+        )
+
+
+# ---------------------------------------------------------------------------
 # File validation dependencies
 # ---------------------------------------------------------------------------
+
+# Magic-byte signatures for the binary types we accept. Text types
+# (txt/csv/tsv/json/xml/html/md) have no reliable signature and are handled
+# downstream as size-bounded text.
+_BINARY_MAGIC: dict[str, tuple[bytes, ...]] = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/jpg": (b"\xff\xd8\xff",),
+    "image/tiff": (b"II*\x00", b"MM\x00*"),
+    "image/bmp": (b"BM",),
+    "application/pdf": (b"%PDF",),
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": (
+        b"PK\x03\x04",
+        b"PK\x05\x06",
+        b"PK\x07\x08",
+    ),
+}
+
+
+def _magic_matches(content_type: Optional[str], header: bytes) -> bool:
+    """Whether *header* bytes are consistent with the declared *content_type*."""
+    signatures = _BINARY_MAGIC.get(content_type or "")
+    if signatures is None:
+        return True  # text type — nothing to sniff
+    return any(header.startswith(sig) for sig in signatures)
 
 
 async def verify_file_type(file: UploadFile = File(...)) -> UploadFile:
@@ -143,6 +196,22 @@ async def verify_file_type(file: UploadFile = File(...)) -> UploadFile:
             ),
         )
 
+    # Content-sniff: for binary types the magic bytes must match the declared
+    # type. Defends against a .png-named text/zip bomb or polyglot upload.
+    try:
+        header = file.file.read(8)
+        file.file.seek(0)
+    except Exception:
+        header = b""
+    if not _magic_matches(content_type, header):
+        logger.warning(
+            "Rejected upload: magic bytes do not match declared type %s", content_type
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File content does not match its declared type.",
+        )
+
     return file
 
 
@@ -192,12 +261,16 @@ async def verify_file_size(file: UploadFile = File(...)) -> UploadFile:
         raise
     except Exception as exc:
         logger.error("Error checking file size: %s", exc)
-        # If we can't determine size, allow it through — the
-        # actual save will fail if it's truly too large
         try:
             spool.seek(0)
         except Exception:
             pass
+        # Fail closed: if size cannot be validated, reject rather than risk an
+        # unbounded write to disk.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not validate file size; upload rejected.",
+        )
 
     return file
 

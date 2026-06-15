@@ -218,18 +218,20 @@ def add_cors_middleware(app: FastAPI) -> None:
     Allows the dashboard (opened via ``file://`` or served from
     ``localhost``) to make cross-origin requests to the API.
     """
+    # The dashboard is served same-origin from /dashboard, so CORS only matters
+    # for a separate local dev frontend. We therefore restrict to localhost
+    # origins, drop the dangerous "null" (file://) origin, and disable
+    # credentialed CORS (the API uses no cookies — an API key goes in a header).
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
-            "http://localhost",
-            "http://127.0.0.1",
-            "app://localhost",   # Flutter desktop (macOS)
-            "null",              # file:// origin (dashboard opened locally)
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
         ],
         allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "X-API-Key", REQUEST_ID_HEADER],
         expose_headers=[REQUEST_ID_HEADER, PROCESS_TIME_HEADER],
     )
 

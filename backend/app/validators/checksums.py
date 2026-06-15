@@ -13,9 +13,6 @@ exceptions for malformed input (return ``False`` instead).
 from __future__ import annotations
 
 
-# Primes used by the German Steuer-ID checksum algorithm (positions 2-10).
-_STEUER_ID_PRIMES: list[int] = [2, 3, 5, 7, 11, 13, 17, 19, 23]
-
 # IBAN country code → expected length mapping (subset for EU/German context).
 _IBAN_LENGTHS: dict[str, int] = {
     "DE": 22,  # Germany
@@ -32,20 +29,23 @@ _IBAN_LENGTHS: dict[str, int] = {
 def validate_steuer_id(steuer_id: str) -> bool:
     """Validate a German Steueridentifikationsnummer (11 digits).
 
-    Algorithm (Bundesministerium der Finanzen):
-      1. The string must contain exactly 11 decimal digits.
-      2. Digit 1 (index 0) is the check digit.
-      3. Digits 2-10 (indices 1-9) form the payload.
-      4. One digit in the payload (digits 2-10) must appear **exactly**
-         twice; all other payload digits must appear exactly once.
-      5. Compute the weighted sum::
+    Implements the **official** Bundeszentralamt für Steuern (BZSt)
+    check-digit procedure — ISO 7064 *MOD 11,10* — together with the
+    structural digit-repetition rule.  The 11th digit is the check digit,
+    computed over the first ten digits.
 
-             sum = Σ (digit[i] * prime[i])  for i = 0..8
+    Structural rule (first 10 digits):
+      Exactly one digit appears **two or three** times; every other digit
+      appears exactly once.  The first digit must not be ``0``.
 
-         where ``prime = [2, 3, 5, 7, 11, 13, 17, 19, 23]``.
-      6. Check digit = 11 - (sum mod 11).  If the result is 10 the
-         number is invalid.  A result of 11 is treated as 0.
-      7. The computed check digit must match the first digit.
+    Check digit (ISO 7064 MOD 11,10)::
+
+        product = 10
+        for d in first_ten_digits:
+            s = (d + product) mod 10
+            if s == 0: s = 10
+            product = (s * 2) mod 11
+        check = (11 - product) mod 10
 
     Parameters
     ----------
@@ -56,7 +56,7 @@ def validate_steuer_id(steuer_id: str) -> bool:
     Returns
     -------
     bool
-        ``True`` if the Steuer-ID is structurally valid.
+        ``True`` only if both the structural rule and the check digit hold.
     """
     if not isinstance(steuer_id, str):
         return False
@@ -69,35 +69,33 @@ def validate_steuer_id(steuer_id: str) -> bool:
         return False
 
     digits: list[int] = [int(ch) for ch in cleaned]
-    check_digit = digits[0]
-    payload = digits[1:]  # 10 digits (positions 2-11)
+    payload = digits[:10]      # first ten digits
+    check_digit = digits[10]   # 11th digit is the check digit
 
-    # The payload (first 10 digits of the 11-digit number) must contain
-    # exactly one digit that appears twice; all others appear once.
-    # This means the 10-digit payload has 9 unique values.
-    if len(set(payload)) != 9:
+    # The first digit of a valid IdNr is never 0.
+    if payload[0] == 0:
         return False
 
-    # Count occurrences of each digit in the payload
+    # Structural rule: exactly one digit repeats (2 or 3 times); rest once.
     from collections import Counter
 
     counts = Counter(payload)
-    twice = [d for d, c in counts.items() if c == 2]
-    if len(twice) != 1:
+    repeated = [d for d, c in counts.items() if c >= 2]
+    if len(repeated) != 1:
+        return False
+    if counts[repeated[0]] not in (2, 3):
+        return False
+    if any(c != 1 for d, c in counts.items() if d != repeated[0]):
         return False
 
-    # Compute weighted sum over the first 9 payload digits
-    # (positions 2-10, i.e. indices 0-8 of payload)
-    weighted_sum = sum(d * p for d, p in zip(payload[:9], _STEUER_ID_PRIMES))
-
-    # Check digit calculation
-    remainder = weighted_sum % 11
-    computed = 11 - remainder
-
-    if computed == 10:
-        return False  # 10 is an invalid check-digit result
-    if computed == 11:
-        computed = 0
+    # ISO 7064 MOD 11,10 check digit over the first ten digits.
+    product = 10
+    for d in payload:
+        s = (d + product) % 10
+        if s == 0:
+            s = 10
+        product = (s * 2) % 11
+    computed = (11 - product) % 10
 
     return computed == check_digit
 
