@@ -122,16 +122,41 @@ def _vignette(img: Image.Image, rng: random.Random) -> Image.Image:
     return Image.fromarray(np.clip(arr * mask[:, :, None], 0, 255).astype(np.uint8))
 
 
+def _on_surface(img: Image.Image, rng: random.Random) -> Image.Image:
+    """Composite the document onto a textured surface with a drop shadow —
+    the 'phone photo of a document on a desk' look (matches the real scans)."""
+    w, h = img.size
+    px, py = int(w * rng.uniform(0.06, 0.18)), int(h * rng.uniform(0.06, 0.16))
+    W, H = w + 2 * px, h + 2 * py
+    base = rng.choice([(62, 52, 42), (92, 92, 97), (42, 47, 57), (120, 110, 95), (32, 32, 34), (150, 145, 138)])
+    nrng = _np_rng(rng)
+    surf = np.zeros((H, W, 3), np.float32) + np.array(base, np.float32)
+    surf += nrng.normal(0.0, rng.uniform(6.0, 16.0), (H, W, 3))
+    coarse = nrng.normal(0.0, rng.uniform(8.0, 22.0), (max(2, H // 30), max(2, W // 30), 3))
+    tex = Image.fromarray(np.clip(128 + coarse, 0, 255).astype(np.uint8)).resize((W, H)).filter(ImageFilter.GaussianBlur(6))
+    surf += (np.asarray(tex).astype(np.float32) - 128.0) * 0.5
+    surface = Image.fromarray(np.clip(surf, 0, 255).astype(np.uint8)).convert("RGBA")
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    off = rng.randint(6, 18)
+    ImageDraw.Draw(shadow).rectangle([px + off, py + off, px + w + off, py + h + off], fill=(0, 0, 0, 150))
+    surface = Image.alpha_composite(surface, shadow.filter(ImageFilter.GaussianBlur(rng.uniform(6.0, 14.0))))
+    doc = img.rotate(rng.uniform(-3.5, 3.5), expand=True, fillcolor=_PAPER, resample=Image.BICUBIC)
+    surface.paste(doc, (px + (w - doc.width) // 2, py + (h - doc.height) // 2))
+    return surface.convert("RGB")
+
+
 # --- pipeline ---------------------------------------------------------------
 
 def augment(img: Image.Image, rng: random.Random) -> Image.Image:
     """Apply baseline + a random mix of heavier degradations."""
-    img = img.convert("RGB")
-    img = _paper_texture(img, rng)                                   # baseline
-    if rng.random() < 0.40:
+    img = _paper_texture(img.convert("RGB"), rng)                   # baseline
+    if rng.random() < 0.50:
+        img = _on_surface(img, rng)                                 # photo on a surface
+    else:
+        angle = rng.uniform(-5.0, 5.0) if rng.random() < 0.85 else rng.choice([-90, 90, 180])
+        img = img.rotate(angle, expand=True, fillcolor=_PAPER, resample=Image.BICUBIC)  # flat scan
+    if rng.random() < 0.35:
         img = _perspective(img, rng)
-    angle = rng.uniform(-5.0, 5.0) if rng.random() < 0.85 else rng.choice([-90, 90, 180])
-    img = img.rotate(angle, expand=True, fillcolor=_PAPER, resample=Image.BICUBIC)
     if rng.random() < 0.60:
         img = _lighting_gradient(img, rng)
     if rng.random() < 0.35:
