@@ -115,10 +115,18 @@ memory, Metal 4**; torch 2.12 with MPS confirmed live (Surya runs on `mps`).
   so an M4 Pro/Max isn't throttled.
 - **MPS robustness**: `PYTORCH_ENABLE_MPS_FALLBACK=1` so any op lacking a Metal
   kernel falls back to CPU instead of crashing the request.
-- **Throughput reality**: dense documents run ~10–31 s/image on the 8-core M4
-  GPU — Metal is genuinely engaged and saturated; the GPU is simply small. The
-  win here is eliminating reload latency and not thrashing memory, not pretending
-  a base-M4 GPU is a datacenter card.
+- **Skip the unused layout model (~30% faster).** The field mapper associates
+  label/value via text-line bounding boxes and never reads Surya's layout
+  blocks, so the layout model — a third per-image model pass — was pure wasted
+  compute. Disabling it cut throughput from **23.0 → 15.8 s/doc** on the German
+  set (Personalausweis 13.8 → 6.8 s, Gehaltsausweis 16.7 → 9.4 s) with the eval
+  **unchanged at 90% exact-match / CER 0.011**.
+- **Throughput reality**: even so, a base-M4 8-core GPU runs Surya at ~6–32
+  s/doc depending on text density — Metal is fully engaged and saturating the
+  GPU; it is simply small. The wins are removing reload latency, skipping wasted
+  compute, and not thrashing memory — not pretending a base-M4 GPU is a
+  datacenter card. (An M4 Pro/Max, or disabling the recognition model's layout
+  step, would scale further.)
 
 `llama.cpp` (`n_gpu_layers=-1`) and embeddings (`device=mps`) were already moved
 onto Metal in the first commit; `health_check` reports the live device.

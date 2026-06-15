@@ -635,7 +635,7 @@ class ExtractionPipeline:
             if not vlm.is_loaded:
                 vlm.load()
             if getattr(vlm, "supports_direct_extraction", False):
-                return ("surya", vlm.extract_document(image_path, with_layout=True))
+                return ("surya", vlm.extract_document(image_path, with_layout=False))
             return ("dual", self.dual_pass.extract(
                 image_path, vlm, learned_context=learned_context))
 
