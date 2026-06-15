@@ -687,8 +687,13 @@ class ExtractionPipeline:
         if llm_used:
             phases.append(ExtractionPhase.LLM_STRUCTURING)
 
+        vlm_model_name = (
+            getattr(payload, "engine", VLMManager.MODEL_ID)
+            if kind == "surya"
+            else VLMManager.MODEL_ID
+        )
         metadata = ExtractionMetadata(
-            vlm_model=VLMManager.MODEL_ID,
+            vlm_model=vlm_model_name,
             llm_model="llama-cpp" if llm_used else "symbolic-validated",
             document_type=document_type,
             phases_completed=list(phases),

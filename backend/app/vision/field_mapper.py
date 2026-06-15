@@ -276,7 +276,9 @@ class SchemaFieldMapper:
         if canonical in _AMOUNT_FIELDS:
             return parse_german_amount(raw_value)
         if canonical in _DATE_FIELDS:
-            m = _RE_DATE.search(raw_value)
+            # Tolerate OCR fragmentation ("01.09. .2030" / "01.09..2030" → date).
+            cleaned = re.sub(r"\.{2,}", ".", raw_value.replace(" ", ""))
+            m = _RE_DATE.search(cleaned)
             return m.group(0) if m else None
         if canonical == "postleitzahl":
             m = _RE_PLZ.search(raw_value)

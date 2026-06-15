@@ -103,6 +103,25 @@ class QualityGate:
     CONTRAST_WEIGHT: float = 0.35
     DIMENSION_WEIGHT: float = 0.25
 
+    def __init__(self, use_tesseract: Optional[bool] = None) -> None:
+        """Create the quality gate.
+
+        Args:
+            use_tesseract: If ``True``, run a tesseract OCR pass for document-type
+                detection and OSD-based 90/180/270° deskew. If ``None`` (default),
+                read ``QUALITY_GATE_FAST`` from config — fast mode skips that
+                ~2-3 s pass and lets the orchestrator classify the document type
+                from the engine's own OCR text instead.
+        """
+        if use_tesseract is None:
+            try:
+                from config import get_settings
+
+                use_tesseract = not bool(getattr(get_settings(), "QUALITY_GATE_FAST", True))
+            except Exception:
+                use_tesseract = False
+        self.use_tesseract = use_tesseract
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -150,8 +169,13 @@ class QualityGate:
         # 4. Minimum dimension check -------------------------------------
         dim_score = self._compute_dimension_score(w, h)
 
-        # 5. Document type detection (keyword heuristic) -----------------
-        form_type = self._detect_document_type(img)
+        # 5. Document type — tesseract keyword pass only when explicitly enabled;
+        # otherwise the orchestrator classifies it from the OCR text (faster).
+        form_type = (
+            self._detect_document_type(img)
+            if self.use_tesseract
+            else DocumentType.UNBEKANNT
+        )
 
         # 6. Combine into legibility score (weighted average) ------------
         legibility_score = (
@@ -285,21 +309,22 @@ class QualityGate:
         triggers auto-rotation — acting on a guess can corrupt an already
         upright page.
         """
-        # Try Tesseract OSD first (the only confident signal).
-        try:
-            import pytesseract
-            osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
-            angle = int(osd.get("rotate", 0)) % 360
-            mapping = {
-                0: "correct",
-                90: "rotated_90",
-                180: "rotated_180",
-                270: "rotated_270",
-            }
-            if angle in mapping:
-                return mapping[angle], angle
-        except Exception:
-            pass  # fall through to heuristic
+        # Tesseract OSD (the only confident rotation signal) — only when enabled.
+        if self.use_tesseract:
+            try:
+                import pytesseract
+                osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+                angle = int(osd.get("rotate", 0)) % 360
+                mapping = {
+                    0: "correct",
+                    90: "rotated_90",
+                    180: "rotated_180",
+                    270: "rotated_270",
+                }
+                if angle in mapping:
+                    return mapping[angle], angle
+            except Exception:
+                pass  # fall through to heuristic
 
         # Fallback: horizontal vs vertical projection variance (display only).
         h_var = float(np.var(np.sum(img, axis=1)))

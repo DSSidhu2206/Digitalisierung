@@ -29,14 +29,34 @@ class VLMManager:
         self.model: Any = None
         self.processor: Any = None
         self._loaded: bool = False
-        # The field mapper associates label/value via text-line bounding boxes
-        # (from detection/recognition), and never reads Surya's layout blocks, so
-        # the layout model is skipped entirely: ~30% faster per document and less
-        # unified memory, with no accuracy impact. Re-enable if layout-aware
-        # mapping is added later.
-        self._extractor = SuryaDocumentExtractor(enable_layout=False, allow_fallback=False)
+        self._engine: str = self._resolve_engine()
+        self._extractor = self._build_extractor()
+        self._fallback: Any = None  # lazy Surya for "tiered" mode
         self._last_image: str | None = None
         self._last_extraction: SuryaExtraction | None = None
+
+    @staticmethod
+    def _resolve_engine() -> str:
+        try:
+            from config import get_settings
+
+            return (getattr(get_settings(), "OCR_ENGINE", "surya") or "surya").strip().lower()
+        except Exception:
+            return "surya"
+
+    def _build_extractor(self) -> Any:
+        """Pick the primary OCR engine from config (Surya by default)."""
+        if self._engine in ("apple-vision", "apple", "vision", "tiered"):
+            try:
+                from app.vision.apple_vision_extractor import AppleVisionExtractor
+
+                return AppleVisionExtractor()
+            except Exception as exc:
+                logger.warning("Apple Vision unavailable (%s); using Surya.", exc)
+                self._engine = "surya"
+        # Layout blocks are not consumed by the field mapper, so the layout model
+        # is skipped: ~30% faster per document and less unified memory.
+        return SuryaDocumentExtractor(enable_layout=False, allow_fallback=False)
 
     @property
     def is_loaded(self) -> bool:
@@ -74,9 +94,35 @@ class VLMManager:
         if self._last_image == path and self._last_extraction is not None:
             return self._last_extraction
         extraction = self._extractor.extract(path, with_layout=with_layout)
+        if self._engine == "tiered" and self._needs_surya_fallback(extraction):
+            extraction = self._surya_fallback(path, extraction)
         self._last_image = path
         self._last_extraction = extraction
         return extraction
+
+    @staticmethod
+    def _needs_surya_fallback(extraction: SuryaExtraction) -> bool:
+        """Tiered: fall back to Surya when the fast engine looks unreliable."""
+        lines = list(getattr(extraction, "lines", []) or [])
+        if len(lines) < 3:
+            return True
+        mean_conf = sum(float(ln.confidence) for ln in lines) / max(len(lines), 1)
+        return mean_conf < 0.55
+
+    def _surya_fallback(self, path: str, primary: SuryaExtraction) -> SuryaExtraction:
+        if self._fallback is None:
+            self._fallback = SuryaDocumentExtractor(enable_layout=False, allow_fallback=True)
+        try:
+            if not self._fallback.is_loaded:
+                self._fallback.load()
+            surya = self._fallback.extract(path)
+            logger.info(
+                "Tiered fallback to Surya (%d vs %d lines)", len(surya.lines), len(primary.lines)
+            )
+            return surya if len(surya.lines) >= len(primary.lines) else primary
+        except Exception as exc:
+            logger.warning("Surya fallback failed (%s); keeping primary result.", exc)
+            return primary
 
     def generate(
         self,

@@ -131,6 +131,39 @@ memory, Metal 4**; torch 2.12 with MPS confirmed live (Surya runs on `mps`).
 `llama.cpp` (`n_gpu_layers=-1`) and embeddings (`device=mps`) were already moved
 onto Metal in the first commit; `health_check` reports the live device.
 
+## Apple Vision OCR (Neural Engine) — optional fast engine
+
+The M4's biggest ML accelerator is the 16-core **Neural Engine**, which
+PyTorch/MPS (and therefore Surya) cannot target — only Apple's Vision framework
+can. Added an `AppleVisionExtractor` behind the same `SuryaExtraction` interface
+(the field mapper consumes it unchanged), selectable via the `OCR_ENGINE` config:
+
+| Engine | Accuracy (4 German docs) | Speed |
+|---|---|---|
+| Surya (GPU) | 90% exact / CER 0.011 | ~15.8 s/doc |
+| **Apple Vision (ANE)** | **85% exact / recall 100%** | **~0.7 s/doc (~23× faster)** |
+
+Of Apple Vision's 3 misses, **2 are the same inherent OCR digit errors as Surya**
+on the skewed Steuerbescheid; the real gap is a single two-column field
+(`arbeitgeber`). Refinements: convert Vision's bottom-left boxes to the
+pipeline's top-left format; merge near-touching same-line fragments (recovered
+the split `gueltig_bis` date, 75% → 85%); German language hints + custom
+bureaucratic vocabulary.
+
+`OCR_ENGINE` options: `surya` (default), `apple-vision`, or **`tiered`** (Apple
+Vision primary with automatic Surya fallback when confidence is weak — sub-second
+on the common path, Surya's robustness on hard scans). `ocrmac` is a darwin-only
+optional dependency; pipeline metadata honestly reports the active engine.
+
+**Fast quality gate (sub-second per request).** With Apple Vision so fast, the
+quality gate's *own* tesseract OCR pass (doc-type + OSD, ~2-3 s/doc) became the
+bottleneck. Under `QUALITY_GATE_FAST` (default), the gate skips tesseract and the
+orchestrator classifies the document type from the engine's OCR text instead
+(all four sample docs classify correctly). Warm per-request latency with Apple
+Vision is then **~0.5-0.9 s/doc** end-to-end (quality gate → OCR → mapping →
+symbolic validation). Set `QUALITY_GATE_FAST=false` to restore tesseract doc-type
++ 90/180/270° deskew for rotated scans.
+
 ## Note on the score
 
 The engineering to reach ~8.5 is implemented and **validated on the real stack**:

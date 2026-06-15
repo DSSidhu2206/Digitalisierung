@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # which is safe because the server binds to localhost by default.
     API_KEY: str = Field(default="")
     VLM_MODEL_ID: str = Field(default="surya-ocr")
+    # OCR engine for the vision path: "surya" (robust, GPU) or "apple-vision"
+    # (Neural-Engine, ~20x faster on Apple Silicon, needs ocrmac). "tiered" runs
+    # Apple Vision and falls back to Surya when its confidence is weak.
+    OCR_ENGINE: str = Field(default="surya")
     LLM_MODEL_PATH: str = Field(default="models/llama-3.1-8b-instruct.Q4_K_M.gguf")
     EMBEDDING_MODEL: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
     LLM_N_THREADS: int = Field(default=8)
@@ -43,6 +47,10 @@ class Settings(BaseSettings):
     RAM_THRESHOLD: float = Field(default=0.80, ge=0.0, le=1.0)
     MAX_CONCURRENT_REQUESTS: int = Field(default=1, ge=1)
     LEGIBILITY_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0)
+    # Fast quality gate: skip the separate tesseract OCR pass for doc-type/OSD
+    # (doc-type is classified from the engine's OCR text instead). Set False to
+    # restore tesseract-based doc-type detection + 90/180/270° auto-deskew.
+    QUALITY_GATE_FAST: bool = Field(default=True)
     CONFIDENCE_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0)
     CHROMA_PERSIST_DIR: str = Field(default="./chroma_data")
     MAX_FEW_SHOT_CORRECTIONS: int = Field(default=5, ge=0)
