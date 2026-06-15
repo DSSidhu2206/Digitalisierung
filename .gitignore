@@ -203,6 +203,9 @@ frontend/tsconfig.tsbuildinfo
 .DS_Store
 backend/models/
 models/
+documents/
+*.tar
+*.tar.gz
 # --- RVL-CDIP dataset ---
 documents/rvl_cdip/
 documents/.DS_Store

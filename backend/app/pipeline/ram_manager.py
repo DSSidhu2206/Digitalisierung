@@ -8,7 +8,8 @@ monitors memory pressure via ``psutil`` to trigger proactive unloading.
 Key guarantees:
   - ``with_vlm`` / ``with_llm`` are the *only* ways to access models.
   - Models are never loaded simultaneously.
-  - If memory pressure exceeds the threshold the model is unloaded after use.
+  - Models stay resident across calls (unified-memory advantage); a model is
+    released only when swapping to the other model or under critical pressure.
   - Context-manager support allows ``async with ram`` for full cleanup.
 
 Spec: Section 8.1 - RAM Manager
@@ -62,7 +63,13 @@ class RAMManager(AbstractAsyncContextManager):
     """
 
     MEMORY_PRESSURE_THRESHOLD: float = 0.80
-    """80 %% of 16 GB = 12.8 GB."""
+    """Soft threshold, used for diagnostics only."""
+
+    MEMORY_CRITICAL_THRESHOLD: float = 0.92
+    """Models are kept GPU-resident across calls to exploit unified memory and
+    avoid reload-per-request latency; a model is only unloaded *after use* when
+    memory is critically high (>92%). Swapping to the other model still unloads
+    unconditionally, so the mutual-exclusion guarantee is preserved."""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -146,7 +153,9 @@ class RAMManager(AbstractAsyncContextManager):
             try:
                 return await callback(self.vlm)
             finally:
-                if self._check_memory_pressure():
+                # Keep resident (unified-memory advantage); only release after
+                # use under critical pressure. Swapping models still unloads.
+                if self._check_critical_pressure():
                     await self._do_unload("vlm")
 
     async def with_llm(self, callback: Callable[[Any], Awaitable[T]]) -> T:
@@ -168,7 +177,9 @@ class RAMManager(AbstractAsyncContextManager):
             try:
                 return await callback(self.llm)
             finally:
-                if self._check_memory_pressure():
+                # Keep resident (unified-memory advantage); only release after
+                # use under critical pressure. Swapping models still unloads.
+                if self._check_critical_pressure():
                     await self._do_unload("llm")
 
     # ------------------------------------------------------------------
@@ -287,3 +298,22 @@ class RAMManager(AbstractAsyncContextManager):
                 self.MEMORY_PRESSURE_THRESHOLD * 100,
             )
         return exceeds
+
+    def _check_critical_pressure(self) -> bool:
+        """Return ``True`` only under *critical* memory pressure.
+
+        Drives the keep-resident policy: a model is released after use only when
+        memory is critically high. Without psutil we prefer residency (return
+        ``False``) rather than reload-thrashing on every request.
+        """
+        if not _PSUTIL_AVAILABLE or psutil is None:
+            return False
+        usage = psutil.virtual_memory().percent / 100
+        if usage > self.MEMORY_CRITICAL_THRESHOLD:
+            logger.info(
+                "Critical memory pressure %.1f%% > %.1f%% — releasing model",
+                usage * 100,
+                self.MEMORY_CRITICAL_THRESHOLD * 100,
+            )
+            return True
+        return False

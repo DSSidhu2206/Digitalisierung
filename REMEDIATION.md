@@ -98,6 +98,31 @@ Steuerbescheid — an OCR-quality limit (the wrong Steuer-ID is correctly flagge
 by checksum validation), not a pipeline defect. Mean CER 0.011 means extractions
 are essentially character-perfect apart from those two misread digits.
 
+## Apple M4 / Metal optimisation
+
+Measured on the actual chip: **Apple M4, 10-core CPU, 8-core GPU, 16 GB unified
+memory, Metal 4**; torch 2.12 with MPS confirmed live (Surya runs on `mps`).
+
+- **Model residency (the real unified-memory win).** The RAM manager unloaded
+  the VLM after *every* call whenever system memory was >80% — which on a 16 GB
+  machine is almost always — forcing a **~3.4 s cold reload per request**. Now
+  models stay GPU-resident across requests and are released only under *critical*
+  (>92%) pressure or when swapping to the other model (mutual exclusion intact).
+- **Memory-adaptive batch sizes** (`runtime_device.py`). Honest finding from
+  benchmarking: on 16 GB, *larger* Surya batches thrash the GPU working set (it
+  swaps) and run **slower**, so the proven 32/4/12 baseline is kept on 16 GB and
+  scaled up only with more unified memory (e.g. 48 GB→96/12/20, 128 GB→192/32/32)
+  so an M4 Pro/Max isn't throttled.
+- **MPS robustness**: `PYTORCH_ENABLE_MPS_FALLBACK=1` so any op lacking a Metal
+  kernel falls back to CPU instead of crashing the request.
+- **Throughput reality**: dense documents run ~10–31 s/image on the 8-core M4
+  GPU — Metal is genuinely engaged and saturated; the GPU is simply small. The
+  win here is eliminating reload latency and not thrashing memory, not pretending
+  a base-M4 GPU is a datacenter card.
+
+`llama.cpp` (`n_gpu_layers=-1`) and embeddings (`device=mps`) were already moved
+onto Metal in the first commit; `health_check` reports the live device.
+
 ## Note on the score
 
 The engineering to reach ~8.5 is implemented and **validated on the real stack**:

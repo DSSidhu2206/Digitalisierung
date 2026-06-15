@@ -17,6 +17,8 @@ from typing import Any, Iterable, Optional
 
 from PIL import Image
 
+from app.runtime_device import configure_mps_runtime, surya_batch_sizes
+
 logger = logging.getLogger(__name__)
 _SURYA_MPS_ATTENTION_PATCHED = False
 
@@ -174,15 +176,16 @@ class SuryaDocumentExtractor:
                 images.append(image)
                 sizes.append(image.size)
 
+            mps_batches = surya_batch_sizes(self.device)
             recognition_batch_size = self._safe_batch_size(
                 "RECOGNITION_BATCH_SIZE",
-                default=32 if self.device == "mps" else None,
-                maximum=32 if self.device == "mps" else None,
+                default=mps_batches["recognition"] if self.device == "mps" else None,
+                maximum=mps_batches["recognition"] if self.device == "mps" else None,
             )
             detection_batch_size = self._safe_batch_size(
                 "DETECTOR_BATCH_SIZE",
-                default=4 if self.device == "mps" else None,
-                maximum=4 if self.device == "mps" else None,
+                default=mps_batches["detector"] if self.device == "mps" else None,
+                maximum=mps_batches["detector"] if self.device == "mps" else None,
             )
             task_name = os.getenv("SURYA_TASK_NAME", "ocr_with_boxes").strip()
             task_names = [task_name] * len(images) if task_name else None
@@ -334,12 +337,23 @@ class SuryaDocumentExtractor:
             os.environ.setdefault("VECLIB_MAXIMUM_THREADS", worker_threads)
             os.environ.setdefault("NUMEXPR_NUM_THREADS", worker_threads)
         if device == "mps":
+            configure_mps_runtime("mps")
+            batches = surya_batch_sizes("mps")
             os.environ["RECOGNITION_BATCH_SIZE"] = str(
-                _bounded_positive_int(os.getenv("RECOGNITION_BATCH_SIZE"), default=32, maximum=32)
+                _bounded_positive_int(
+                    os.getenv("RECOGNITION_BATCH_SIZE"),
+                    default=batches["recognition"],
+                    maximum=batches["recognition"],
+                )
             )
             os.environ["DETECTOR_BATCH_SIZE"] = str(
-                _bounded_positive_int(os.getenv("DETECTOR_BATCH_SIZE"), default=4, maximum=4)
+                _bounded_positive_int(
+                    os.getenv("DETECTOR_BATCH_SIZE"),
+                    default=batches["detector"],
+                    maximum=batches["detector"],
+                )
             )
+            os.environ.setdefault("LAYOUT_BATCH_SIZE", str(batches["layout"]))
         elif "RECOGNITION_BATCH_SIZE" not in os.environ:
             os.environ["RECOGNITION_BATCH_SIZE"] = os.getenv(
                 "SURYA_RECOGNITION_BATCH_SIZE",
