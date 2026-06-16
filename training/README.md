@@ -23,8 +23,10 @@ python scripts/package_dataset.py                      # -> data/german-docs-syn
 ## 3. Upload to Kaggle as a Dataset
 
 - https://www.kaggle.com/datasets → **New Dataset** → upload `german-docs-synthetic.zip`
-  (Kaggle auto-extracts to `/kaggle/input/german-docs-synthetic/`).
-- Give it the slug `german-docs-synthetic` (or update `DATA` in the notebook).
+  (Kaggle auto-extracts the contents).
+- The notebook **auto-detects** the dataset path (it globs for
+  `manifest.train.jsonl` under `/kaggle/input/`), so the exact slug/mount
+  doesn't matter — just attach it as an Input.
 
 ## 4. Train
 

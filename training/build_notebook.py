@@ -35,7 +35,10 @@ from transformers import (
 )
 
 # --- config ---------------------------------------------------------------
-DATA = Path("/kaggle/input/german-docs-synthetic")   # images/ + manifest.*.jsonl
+# Auto-detect the dataset path (Kaggle's mount slug / zip nesting can vary).
+import glob
+_hits = glob.glob("/kaggle/input/**/manifest.train.jsonl", recursive=True)
+DATA = Path(_hits[0]).parent if _hits else Path("/kaggle/input/german-docs-synthetic")
 OUT = "/kaggle/working/donut-german"
 BASE_MODEL = "naver-clova-ix/donut-base"
 TASK = "<s_docextract>"
