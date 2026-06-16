@@ -1,5 +1,17 @@
 # Digitalisierung
 
+German bureaucratic-document extraction: upload a scanned form, get validated
+structured fields. A production OCR pipeline (Surya / Apple Vision → layout
+mapping → symbolic validation) reaching **90% exact-match** on real, degraded
+documents — plus a rigorous R&D experiment testing whether a synthetic-trained,
+OCR-free model could beat it.
+
+- **Methodology** — [DATASET.md](DATASET.md): train-on-synthetic / eval-on-real.
+- **Experiment & honest results** — [training/RESULTS.md](training/RESULTS.md):
+  Donut **40%** vs OCR **90%**, with the analysis of why.
+- **Audit & remediation** — [ANALYSIS.md](ANALYSIS.md),
+  [REMEDIATION.md](REMEDIATION.md).
+
 ## Quick Start
 
 ```bash

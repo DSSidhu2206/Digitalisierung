@@ -49,10 +49,18 @@ hand). **This is never trained on.** It is the only set used to report accuracy.
 | `test_documents/` | real scans, 4 docs | **final eval only** | **no** |
 
 Reported numbers come exclusively from the real hold-out via
-`scripts/eval_german_documents.py` (CER / WER / exact-match / F1). A model trained
-purely on synthetic data that scores well on the *real* documents is the result
-worth showing — it proves the synthetic pipeline transfers, not that the model
-memorised its training set.
+`scripts/eval_german_documents.py` (OCR pipeline) and `scripts/eval_donut.py`
+(the fine-tuned model), using identical metric code (CER / WER / exact-match / F1).
+
+## Outcome
+
+The experiment was run and **measured honestly — see
+[training/RESULTS.md](training/RESULTS.md).** Short version: the OCR pipeline
+reaches **90%** exact-match on the real hold-out, while the synthetic-trained
+Donut reaches **40%** — the synthetic→real gap is too large for an OCR-free model
+to beat general OCR on synthetic data alone. The methodology did its job: it
+surfaced a real negative result instead of a synthetic-validation mirage.
 
 > Next: expand the real hold-out beyond 4 documents to tighten the confidence
-> interval on the reported accuracy.
+> interval; if revisiting the model, close the synthetic→real gap (more realistic
+> data) before adding epochs — see RESULTS.md.
