@@ -24,7 +24,9 @@ If your dataset's input path differs, fix `DATA` in the config cell.
 
     ("code", """!pip -q install -U "transformers>=4.40" datasets sentencepiece"""),
 
-    ("code", """import json, random
+    ("code", """import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import json, random
 from pathlib import Path
 import torch
 from PIL import Image
@@ -56,6 +58,15 @@ print(f"train={len(train_recs)}  val={len(val_recs)}")
 
 processor = DonutProcessor.from_pretrained(BASE_MODEL)
 model = VisionEncoderDecoderModel.from_pretrained(BASE_MODEL)
+
+# donut-base ingests at 2560x1920 by default -> too big for a 15 GB T4.
+# Halving each side (1/4 the pixels) is the main memory lever and is plenty
+# for single-page forms. Donut's Swin encoder is convolutional with no
+# absolute position embedding, so a smaller input resolution is safe.
+INPUT_SIZE = [1280, 960]            # [height, width]
+processor.image_processor.size = {"height": INPUT_SIZE[0], "width": INPUT_SIZE[1]}
+model.config.encoder.image_size = INPUT_SIZE
+print("input resolution:", processor.image_processor.size)
 
 field_keys = sorted({k for r in train_recs for k in r["fields"]})
 new_tokens = [TASK] + [f"<s_{k}>" for k in field_keys] + [f"</s_{k}>" for k in field_keys]
