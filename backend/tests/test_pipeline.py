@@ -436,7 +436,7 @@ class TestExtractionPipeline:
     @pytest.mark.asyncio
     async def test_get_extraction_not_found(self, pipeline: ExtractionPipeline) -> None:
         """get_extraction returns None for unknown ID."""
-        result = await pipeline.get_extraction(uuid4())
+        result = pipeline.get_extraction(str(uuid4()))
         assert result is None
 
     @pytest.mark.asyncio

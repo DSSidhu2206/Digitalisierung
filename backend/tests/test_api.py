@@ -163,8 +163,16 @@ def _make_image_file(
     Returns:
         (file_bytes, filename)
     """
-    # Minimal PNG header (89 50 4E 47 0D 0A 1A 0A) + padding
-    header = b"\x89PNG\r\n\x1a\n"
+    # Emit magic bytes matching the declared content type so uploads pass the
+    # content-sniff check (which now rejects fake/mismatched files).
+    headers = {
+        "image/png": b"\x89PNG\r\n\x1a\n",
+        "image/jpeg": b"\xff\xd8\xff\xe0",
+        "image/jpg": b"\xff\xd8\xff\xe0",
+        "image/tiff": b"II*\x00",
+        "image/bmp": b"BM",
+    }
+    header = headers.get(content_type, b"\x89PNG\r\n\x1a\n")
     padding = b"\x00" * max(0, size_bytes - len(header))
     return header + padding, filename
 

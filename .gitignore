@@ -194,13 +194,19 @@ dist/
 backend/chroma_data/
 backend/logs/
 backend/uploads/
+backend/extraction_store/
 chroma_data/
 logs/
 uploads/
+extraction_store/
 frontend/tsconfig.tsbuildinfo
 .DS_Store
 backend/models/
 models/
+documents/
+data/
+*.tar
+*.tar.gz
 # --- RVL-CDIP dataset ---
 documents/rvl_cdip/
 documents/.DS_Store

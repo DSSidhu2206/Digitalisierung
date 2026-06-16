@@ -40,6 +40,7 @@ from app.models import (
 )
 from app.pipeline.audit_logger import AuditLogger
 from app.pipeline.local_training import LocalTrainingManager
+from app.vision.field_mapper import MappedField, SchemaFieldMapper
 from app.vision.quality_gate import QualityGate
 from app.vision.vlm_loader import VLMManager
 
@@ -77,6 +78,7 @@ class ExtractionPipeline:
         project_root = Path(__file__).resolve().parents[3]
         image_learning_dir = chroma_persist_dir or str(project_root / "chroma_data")
         self.quality_gate = QualityGate()
+        self.field_mapper = SchemaFieldMapper()
         self.chroma = ChromaManager(persist_dir=chroma_persist_dir or "./chroma_data")
         self.image_learning = ImageLearningStore(persist_dir=image_learning_dir)
         self.local_training = LocalTrainingManager(project_root, self.image_learning)
@@ -87,6 +89,7 @@ class ExtractionPipeline:
         # In-memory store for extraction results (keyed by extraction_id)
         self._extraction_store: Dict[str, ExtractionResult] = {}
         self._use_mocks = use_mocks
+        self._store_dir = Path(__file__).resolve().parents[2] / "extraction_store"
         logger.info("ExtractionPipeline initialised (mock=%s)", use_mocks)
 
     # ------------------------------------------------------------------
@@ -156,19 +159,16 @@ class ExtractionPipeline:
                 phases=phases,
             )
 
-        # --- Stage 2-5: Run Surya extraction and validation -------------
+        # --- Stage 2-5: Surya extraction → schema mapping → validation --
+        # Upright the page first if the quality gate confidently detected a
+        # 90/180/270° rotation (OCR accuracy collapses on rotated input).
+        working_path, oriented_temp = self.quality_gate.deskew_to_temp(
+            image_path, assessment
+        )
         try:
-            phases.extend([
-                ExtractionPhase.VISION_PASS_A,
-                ExtractionPhase.VISION_PASS_B,
-                ExtractionPhase.CONSISTENCY_CHECK,
-                ExtractionPhase.SYMBOLIC_VALIDATION,
-                ExtractionPhase.LLM_STRUCTURING,
-            ])
-
             result = await self._dual_pass_extraction_result(
                 document_type=detected_doc_type,
-                image_path=image_path,
+                image_path=working_path,
                 assessment=assessment,
                 start_time=start_time,
                 phases=phases,
@@ -183,6 +183,12 @@ class ExtractionPipeline:
                 start_time=start_time,
                 phases=phases,
             )
+        finally:
+            if oriented_temp and oriented_temp != image_path:
+                try:
+                    os.remove(oriented_temp)
+                except OSError:
+                    pass
 
         # --- Stage 6: Audit logging -------------------------------------
         try:
@@ -190,8 +196,9 @@ class ExtractionPipeline:
         except Exception as exc:
             logger.error("Audit logging error (non-fatal): %s", exc)
 
-        # --- Stage 7: Store for retrieval -------------------------------
+        # --- Stage 7: Store for retrieval (memory + disk) ---------------
         self._extraction_store[str(result.metadata.extraction_id)] = result
+        self._persist_result(result)
 
         phases.append(ExtractionPhase.COMPLETE)
         result.metadata.phases_completed = phases
@@ -268,13 +275,19 @@ class ExtractionPipeline:
     def get_extraction(self, extraction_id: str) -> Optional[ExtractionResult]:
         """Retrieve a previously stored extraction by ID.
 
+        Checks the in-memory store first, then falls back to the on-disk store
+        so results survive a server restart.
+
         Args:
             extraction_id: UUID string of the extraction.
 
         Returns:
             The :class:`ExtractionResult` if found, else ``None``.
         """
-        return self._extraction_store.get(extraction_id)
+        cached = self._extraction_store.get(extraction_id)
+        if cached is not None:
+            return cached
+        return self._load_result(extraction_id)
 
     # ------------------------------------------------------------------
     # Statistics
@@ -299,10 +312,6 @@ class ExtractionPipeline:
             "image_learning": self.image_learning.stats(),
             "mock_mode": self._use_mocks,
         }
-
-    async def get_extraction(self, extraction_id: "UUID") -> Optional[ExtractionResult]:
-        """Async wrapper for retrieving an extraction by ID."""
-        return self._extraction_store.get(str(extraction_id))
 
     # ------------------------------------------------------------------
     # Health
@@ -365,10 +374,33 @@ class ExtractionPipeline:
         import psutil
 
         mem = psutil.virtual_memory()
+        vlm_loaded = False
+        llm_loaded = False
+        ram = getattr(self, "_ram", None)
+        if ram is not None:
+            try:
+                vlm = getattr(ram, "_vlm", None)
+                vlm_loaded = bool(vlm is not None and vlm.is_loaded)
+            except Exception:
+                pass
+            try:
+                llm = getattr(ram, "_llm", None)
+                is_loaded_attr = getattr(llm, "is_loaded", False)
+                llm_loaded = bool(is_loaded_attr() if callable(is_loaded_attr) else is_loaded_attr)
+            except Exception:
+                pass
+        device = "cpu"
+        try:
+            from app.database.embedding_model import _resolve_device
+
+            device = _resolve_device()
+        except Exception:
+            pass
         return {
-            "vlm_loaded": False,  # TODO: wire to VLMManager
-            "llm_loaded": False,  # TODO: wire to LLMManager
+            "vlm_loaded": vlm_loaded,
+            "llm_loaded": llm_loaded,
             "ram_usage_mb": round(mem.used / (1024 * 1024), 2),
+            "device": device,
         }
 
     # ------------------------------------------------------------------
@@ -380,6 +412,27 @@ class ExtractionPipeline:
         logger.info("ExtractionPipeline shutting down")
         # Clean up in-memory store
         self._extraction_store.clear()
+
+    def _persist_result(self, result: ExtractionResult) -> None:
+        """Persist an extraction to disk so /extractions survives a restart."""
+        try:
+            self._store_dir.mkdir(parents=True, exist_ok=True)
+            path = self._store_dir / f"{result.metadata.extraction_id}.json"
+            path.write_text(result.model_dump_json(), encoding="utf-8")
+        except Exception as exc:
+            logger.debug("Could not persist extraction result: %s", exc)
+
+    def _load_result(self, extraction_id: str) -> Optional[ExtractionResult]:
+        """Load a persisted extraction from disk, if present."""
+        try:
+            path = self._store_dir / f"{extraction_id}.json"
+            if path.is_file():
+                return ExtractionResult.model_validate_json(
+                    path.read_text(encoding="utf-8")
+                )
+        except Exception as exc:
+            logger.debug("Could not load persisted extraction %s: %s", extraction_id, exc)
+        return None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -504,6 +557,7 @@ class ExtractionPipeline:
         except Exception as exc:
             logger.error("Audit logging error (non-fatal): %s", exc)
         self._extraction_store[str(result.metadata.extraction_id)] = result
+        self._persist_result(result)
         return result
 
     def _fields_from_text(self, text: str) -> dict[str, FieldResult]:
@@ -559,20 +613,14 @@ class ExtractionPipeline:
         start_time: float,
         phases: list[ExtractionPhase],
     ) -> ExtractionResult:
-        """Build an extraction result from the dual-pass vision output.
+        """Run vision extraction → schema mapping → symbolic validation.
 
-        This path is intentionally used for degraded or unclassified images.
-        It preserves partially readable values as low-confidence review items
-        instead of collapsing the whole request to a single 0-confidence
-        refusal field.
+        Real path (Surya): a single OCR/layout pass feeds the layout-aware
+        :class:`SchemaFieldMapper`, then correction memory and the symbolic
+        validator. Mock path: the canned dual-pass value map. The phases
+        recorded reflect only what actually executed — no cosmetic labels.
         """
-        metadata = ExtractionMetadata(
-            vlm_model=VLMManager.MODEL_ID,
-            llm_model="dual-pass-only",
-            document_type=document_type,
-            phases_completed=phases,
-            processing_time_ms=(time.perf_counter() - start_time) * 1000,
-        )
+        # Recognition hints for noisy scans (few-shot image learning).
         learned_examples = self.image_learning.retrieve_similar(
             query_text=(
                 f"document_type={document_type.value}\n"
@@ -581,29 +629,77 @@ class ExtractionPipeline:
             ),
             document_type=document_type.value,
         )
-        metadata.few_shot_injections = len(learned_examples)
         learned_context = self.image_learning.build_prompt_section(learned_examples)
 
-        async def run_dual_pass(vlm: Any) -> Any:
-            return self.dual_pass.extract(
-                image_path,
-                vlm,
-                learned_context=learned_context,
+        async def run_vlm(vlm: Any) -> Any:
+            if not vlm.is_loaded:
+                vlm.load()
+            if getattr(vlm, "supports_direct_extraction", False):
+                return ("surya", vlm.extract_document(image_path, with_layout=False))
+            return ("dual", self.dual_pass.extract(
+                image_path, vlm, learned_context=learned_context))
+
+        kind, payload = await self.ram.with_vlm(run_vlm)
+
+        if kind == "surya":
+            # Re-classify from the full Surya OCR text when the quality-gate
+            # preview was inconclusive. This is more reliable than the gate's
+            # quick down-sampled tesseract pass and works even without tesseract.
+            if document_type == DocumentType.UNBEKANNT:
+                reclassified = self._classify_from_text(getattr(payload, "text", "") or "")
+                if reclassified is not None:
+                    document_type = reclassified
+            mapped = self.field_mapper.map(payload, document_type)
+        else:
+            mapped = self._mapped_from_value_map(payload)
+
+        # Scale confidence by assessed image quality.
+        quality_factor = max(0.5, min(float(assessment.legibility_score), 1.0))
+        if not assessment.is_admissible:
+            quality_factor = min(quality_factor, 0.6)
+        for mapped_field in mapped.values():
+            mapped_field.confidence = max(
+                0.0, min(mapped_field.confidence * quality_factor, 1.0)
             )
 
-        dual_result = await self.ram.with_vlm(run_dual_pass)
-        fields = self._fields_from_dual_pass(dual_result, assessment)
+        fields, llm_used = self._build_validated_fields(
+            mapped, document_type, image_path
+        )
+
         if not fields:
-            reason = "No readable fields found after degraded dual-pass extraction"
             fields = {
                 "_unresolved": FieldResult(
                     field_name="_unresolved",
                     value=None,
                     status=FieldStatus.UNRESOLVED,
                     confidence=max(0.0, min(float(assessment.legibility_score), 0.25)),
-                    validation_message=reason,
+                    validation_message="No readable fields found",
                 )
             }
+
+        # Record only phases that truly ran.
+        phases.append(ExtractionPhase.VISION_PASS_A)
+        if kind == "dual":
+            phases.extend(
+                [ExtractionPhase.VISION_PASS_B, ExtractionPhase.CONSISTENCY_CHECK]
+            )
+        phases.append(ExtractionPhase.SYMBOLIC_VALIDATION)
+        if llm_used:
+            phases.append(ExtractionPhase.LLM_STRUCTURING)
+
+        vlm_model_name = (
+            getattr(payload, "engine", VLMManager.MODEL_ID)
+            if kind == "surya"
+            else VLMManager.MODEL_ID
+        )
+        metadata = ExtractionMetadata(
+            vlm_model=vlm_model_name,
+            llm_model="llama-cpp" if llm_used else "symbolic-validated",
+            document_type=document_type,
+            phases_completed=list(phases),
+            processing_time_ms=(time.perf_counter() - start_time) * 1000,
+        )
+        metadata.few_shot_injections = len(learned_examples)
 
         return ExtractionResult(
             metadata=metadata,
@@ -611,61 +707,244 @@ class ExtractionPipeline:
             fields=fields,
         )
 
-    def _fields_from_dual_pass(
-        self,
-        dual_result: Any,
-        assessment: Any,
-    ) -> dict[str, FieldResult]:
-        """Convert dual-pass values into reviewable field results."""
-        fields: dict[str, FieldResult] = {}
-        quality_factor = max(0.25, min(float(assessment.legibility_score), 1.0))
-        if not assessment.is_admissible:
-            quality_factor = min(quality_factor, 0.49)
+    _DOCTYPE_KEYWORDS: dict[DocumentType, list[str]] = {
+        DocumentType.MELDEBESCHEINIGUNG: [
+            "meldebescheinigung", "meldebehörde", "meldeamt", "bürgeramt", "einzugsdatum",
+        ],
+        DocumentType.STEUERBESCHEID: [
+            "steuerbescheid", "finanzamt", "steueridentifikationsnummer",
+            "einkommensteuer", "veranlagungszeitraum",
+        ],
+        DocumentType.GEHALTSAUSWEIS: [
+            "gehaltsausweis", "lohnabrechnung", "gehaltsabrechnung", "nettolohn",
+            "gesamt-brutto", "sozialversicherung",
+        ],
+        DocumentType.PERSONALAUSWEIS: [
+            "personalausweis", "bundesrepublik deutschland", "dokumentnummer",
+            "gültig bis", "ausweisnummer",
+        ],
+    }
 
-        warning = assessment.rejection_reason
-        for field_name, value_entry in dual_result.value_map.items():
-            if not isinstance(value_entry, dict):
+    @classmethod
+    def _classify_from_text(cls, text: str) -> Optional[DocumentType]:
+        """Keyword-classify a document type from OCR text (None if no match)."""
+        lower = text.lower()
+        best: Optional[DocumentType] = None
+        best_count = 0
+        for doc_type, words in cls._DOCTYPE_KEYWORDS.items():
+            count = sum(1 for word in words if word in lower)
+            if count > best_count:
+                best, best_count = doc_type, count
+        return best if best_count > 0 else None
+
+    def _mapped_from_value_map(self, dual_result: Any) -> dict[str, MappedField]:
+        """Adapt a (mock) DualPassResult value/structural map to MappedFields."""
+        mapped: dict[str, MappedField] = {}
+        value_map = getattr(dual_result, "value_map", {}) or {}
+        structural = getattr(dual_result, "structural_map", {}) or {}
+        for name, entry in value_map.items():
+            if not isinstance(entry, dict):
                 continue
-
-            raw_confidence = self._coerce_confidence(
-                value_entry.get("confidence_0_to_1", 0.0)
-            )
-            confidence = max(0.0, min(raw_confidence * quality_factor, 1.0))
-            raw_value = value_entry.get("raw_value")
+            raw_value = entry.get("raw_value")
+            confidence = self._coerce_confidence(entry.get("confidence_0_to_1", 0.0))
+            bbox = None
+            struct = structural.get(name)
+            if isinstance(struct, dict):
+                bbox = struct.get("estimated_bbox")
             has_value = raw_value not in (None, "", "null", "None")
-
-            if not has_value:
-                status = FieldStatus.UNRESOLVED
-            elif confidence < self.LOW_CONFIDENCE_THRESHOLD:
-                status = FieldStatus.LOW_CONFIDENCE
-            else:
-                status = FieldStatus.EXTRACTED
-
-            fields[field_name] = FieldResult(
-                field_name=field_name,
+            mapped[name] = MappedField(
+                field_name=name,
                 value=raw_value if has_value else None,
-                status=status,
                 confidence=confidence,
-                source_bbox=self._bbox_from_structure(
-                    dual_result.structural_map.get(field_name, {})
-                ),
-                raw_text=str(raw_value) if raw_value is not None else None,
-                validation_message=warning if status != FieldStatus.EXTRACTED else None,
+                raw_text=str(raw_value) if raw_value is not None else "",
+                bbox=bbox if isinstance(bbox, dict) else None,
+                source="inline",
+            )
+        return mapped
+
+    def _apply_corrections(
+        self, canonical: dict[str, MappedField], document_type: DocumentType
+    ) -> set[str]:
+        """Auto-apply exact-match corrections from memory (closes the loop).
+
+        Only an *exact* (case-insensitive) match between a stored correction's
+        original text and the current raw value triggers a substitution — this
+        is deterministic correction recall, never fabrication.
+        """
+        applied: set[str] = set()
+        try:
+            if self.chroma.get_stats().get("total", 0) <= 0:
+                return applied
+        except Exception:
+            return applied
+
+        for name, mapped_field in canonical.items():
+            raw = (
+                mapped_field.raw_text
+                or ("" if mapped_field.value is None else str(mapped_field.value))
+            ).strip()
+            if not raw:
+                continue
+            try:
+                hits = self.chroma.retrieve_relevant(name, raw, document_type.value)
+            except Exception as exc:
+                logger.debug("Correction retrieval failed for %s: %s", name, exc)
+                continue
+            for hit in hits:
+                original = str(hit.get("original", "")).strip()
+                corrected = hit.get("corrected")
+                if original and corrected is not None and original.lower() == raw.lower():
+                    mapped_field.value = corrected
+                    applied.add(name)
+                    logger.info("Applied correction memory to field '%s'", name)
+                    break
+        return applied
+
+    def _build_validated_fields(
+        self,
+        mapped: dict[str, MappedField],
+        document_type: DocumentType,
+        image_path: str,
+    ) -> tuple[dict[str, FieldResult], bool]:
+        """Correction recall + symbolic validation → FieldResults.
+
+        Returns ``(fields, llm_used)``.
+        """
+        canonical = {n: mf for n, mf in mapped.items() if not n.startswith("_line_")}
+
+        # Optional LLM structuring refinement (no-op unless weights present).
+        llm_used = self._maybe_llm_structuring(canonical, document_type, image_path)
+
+        # Correction memory recall — the learning loop, now closed.
+        corrected = self._apply_corrections(canonical, document_type)
+
+        # Deterministic symbolic validation (regex + checksum + business rules).
+        valued = {n: mf.value for n, mf in canonical.items()}
+        validated = self.validator.validate_document(document_type, valued)
+
+        fields: dict[str, FieldResult] = {}
+        for name, mapped_field in canonical.items():
+            result = validated.get(name)
+            status = result.status if result is not None else FieldStatus.EXTRACTED
+            message = result.validation_message if result is not None else None
+            if name in corrected:
+                status = FieldStatus.CORRECTED
+                message = "Auto-applied from correction memory"
+            elif (
+                status == FieldStatus.EXTRACTED
+                and mapped_field.confidence < self.LOW_CONFIDENCE_THRESHOLD
+            ):
+                status = FieldStatus.LOW_CONFIDENCE
+                message = "Below confidence threshold — review recommended"
+            fields[name] = FieldResult(
+                field_name=name,
+                value=mapped_field.value,
+                status=status,
+                confidence=mapped_field.confidence,
+                source_bbox=self._bbox_to_model(mapped_field.bbox),
+                raw_text=mapped_field.raw_text or None,
+                validation_message=message,
             )
 
-        for field_name in set(dual_result.structural_map) - set(fields):
-            fields[field_name] = FieldResult(
-                field_name=field_name,
-                value=None,
-                status=FieldStatus.UNRESOLVED,
-                confidence=0.0,
-                source_bbox=self._bbox_from_structure(
-                    dual_result.structural_map.get(field_name, {})
-                ),
-                validation_message="Field detected but no value was readable",
+        # Preserve unmapped OCR lines as low-confidence review items.
+        for name, mapped_field in mapped.items():
+            if not name.startswith("_line_"):
+                continue
+            fields[name] = FieldResult(
+                field_name=name,
+                value=mapped_field.value,
+                status=FieldStatus.LOW_CONFIDENCE,
+                confidence=mapped_field.confidence,
+                source_bbox=self._bbox_to_model(mapped_field.bbox),
+                raw_text=mapped_field.raw_text or None,
+                validation_message="Unmapped OCR line — not a recognised field",
             )
+        return fields, llm_used
 
-        return fields
+    def _maybe_llm_structuring(
+        self,
+        canonical: dict[str, MappedField],
+        document_type: DocumentType,
+        image_path: str,
+    ) -> bool:
+        """Optional local-LLM structuring hook. Returns whether it ran.
+
+        Disabled (returns ``False``) unless a GGUF model and llama.cpp are
+        available, so metadata never claims an LLM ran when it did not. The
+        real implementation lives in :meth:`_run_llm_structuring`.
+        """
+        try:
+            return self._run_llm_structuring(canonical, document_type, image_path)
+        except Exception as exc:  # never let optional refinement break extraction
+            logger.debug("LLM structuring skipped: %s", exc)
+            return False
+
+    def _run_llm_structuring(
+        self,
+        canonical: dict[str, MappedField],
+        document_type: DocumentType,
+        image_path: str,
+    ) -> bool:
+        """Fill OCR-missed fields with a local GGUF model (Metal). Guarded.
+
+        Returns ``True`` only if the model actually ran and contributed at least
+        one value. Disabled unless ``ENABLE_LLM_STRUCTURING`` is set, the GGUF
+        model exists on disk, and ``llama-cpp-python`` is importable. LLM-filled
+        values are given sub-threshold confidence so they remain flagged for
+        review and are still subject to symbolic validation downstream.
+        """
+        from config import get_settings
+
+        settings = get_settings()
+        if not getattr(settings, "ENABLE_LLM_STRUCTURING", False):
+            return False
+
+        model_path = Path(settings.LLM_MODEL_PATH)
+        if not model_path.is_absolute():
+            model_path = Path(__file__).resolve().parents[3] / model_path
+        if not model_path.exists():
+            logger.info("LLM structuring enabled but model not found: %s", model_path)
+            return False
+        try:
+            import llama_cpp  # noqa: F401
+        except Exception:
+            logger.info("LLM structuring enabled but llama-cpp-python is unavailable")
+            return False
+
+        missing = [
+            name
+            for name, mapped_field in canonical.items()
+            if mapped_field.value is None
+            or mapped_field.confidence < self.LOW_CONFIDENCE_THRESHOLD
+        ]
+        if not missing:
+            return False
+
+        from app.llm.llm_structurer import LLMStructurer
+
+        structurer = LLMStructurer(
+            str(model_path),
+            n_ctx=settings.LLM_N_CTX,
+            n_threads=settings.LLM_N_THREADS,
+            n_gpu_layers=settings.LLM_N_GPU_LAYERS,
+            temperature=settings.LLM_TEMPERATURE,
+        )
+        try:
+            filled = structurer.fill_fields(document_type, canonical, missing)
+        finally:
+            structurer.close()
+
+        applied = False
+        for name, (value, confidence) in (filled or {}).items():
+            mapped_field = canonical.get(name)
+            if mapped_field is None or value in (None, ""):
+                continue
+            if confidence > mapped_field.confidence:
+                mapped_field.value = value
+                mapped_field.confidence = confidence
+                mapped_field.source = "llm"
+                applied = True
+        return applied
 
     @staticmethod
     def _coerce_confidence(value: Any) -> float:
@@ -676,16 +955,16 @@ class ExtractionPipeline:
             return 0.0
 
     @staticmethod
-    def _bbox_from_structure(structure_entry: Any) -> Optional[BoundingBox]:
-        """Build a BoundingBox from dual-pass structural metadata."""
-        if not isinstance(structure_entry, dict):
-            return None
-        bbox_data = structure_entry.get("estimated_bbox")
-        if not isinstance(bbox_data, dict):
+    def _bbox_to_model(bbox: Any) -> Optional[BoundingBox]:
+        """Build a validated BoundingBox from a normalised bbox dict."""
+        if not isinstance(bbox, dict):
             return None
         try:
-            bbox = BoundingBox(**bbox_data)
-            return bbox if bbox.is_valid() else None
+            coords = {k: float(bbox[k]) for k in ("x1", "y1", "x2", "y2") if k in bbox}
+            if len(coords) != 4:
+                return None
+            model = BoundingBox(**coords)
+            return model if model.is_valid() else None
         except Exception:
             return None
 

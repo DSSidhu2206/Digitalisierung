@@ -152,6 +152,30 @@ install_packages() {
 # 5. Download model weights
 # ---------------------------------------------------------------------------
 
+# Verify a downloaded GGUF: magic bytes + optional pinned SHA-256.
+verify_gguf() {
+    local f="$1"
+    [[ -f "$f" ]] || { info "Model file missing: $f"; return 1; }
+    local magic
+    magic="$(head -c 4 "$f" 2>/dev/null)"
+    if [[ "$magic" != "GGUF" ]]; then
+        info "File is not a valid GGUF (got '${magic}') — truncated or HTML error response?"
+        return 1
+    fi
+    if [[ -n "${LLM_MODEL_SHA256:-}" ]]; then
+        local got
+        got="$(shasum -a 256 "$f" | awk '{print $1}')"
+        if [[ "$got" != "$LLM_MODEL_SHA256" ]]; then
+            info "SHA-256 mismatch: expected ${LLM_MODEL_SHA256}, got ${got}"
+            return 1
+        fi
+        ok "Model SHA-256 verified"
+    else
+        info "No LLM_MODEL_SHA256 pinned; verified GGUF header only (set it in .env to pin)"
+    fi
+    return 0
+}
+
 download_models() {
     info "Downloading model weights ..."
 
@@ -168,13 +192,19 @@ download_models() {
         info "Downloading Llama-3.1-8B-Instruct Q4_K_M (~5 GB) ..."
         info "URL: $gguf_url"
         if command -v curl &>/dev/null; then
-            curl -L --progress-bar "$gguf_url" -o "$gguf_file"
+            curl -L --fail --progress-bar "$gguf_url" -o "$gguf_file" \
+                || { rm -f "$gguf_file"; fail "Model download failed (HTTP error)"; }
         elif command -v wget &>/dev/null; then
-            wget --progress=bar:force "$gguf_url" -O "$gguf_file"
+            wget --progress=bar:force "$gguf_url" -O "$gguf_file" \
+                || { rm -f "$gguf_file"; fail "Model download failed (HTTP error)"; }
         else
             fail "curl or wget required to download models"
         fi
-        ok "LLM model downloaded"
+        if ! verify_gguf "$gguf_file"; then
+            rm -f "$gguf_file"
+            fail "Downloaded model failed integrity check (corrupt or wrong file)"
+        fi
+        ok "LLM model downloaded and verified"
     fi
 
     info "VLM model (Llama-3.2-11B-Vision) downloads automatically on first run"

@@ -38,6 +38,10 @@ sentence-transformers>=3.3.0
 surya-ocr>=0.17.1
 transformers>=4.56.1,<5.0.0
 
+# Apple Vision OCR (Neural Engine) — optional fast OCR engine on macOS.
+# Enable via OCR_ENGINE=apple-vision (or =tiered for Vision + Surya fallback).
+ocrmac>=1.0.0; sys_platform == "darwin"
+
 # LLM inference via llama.cpp (auto-installed on macOS, skipped elsewhere)
 llama-cpp-python>=0.3.5; sys_platform == "darwin"
 pytesseract>=0.3.10

@@ -61,6 +61,7 @@ class QualityAssessment:
     form_type: DocumentType
     is_admissible: bool
     rejection_reason: Optional[str] = None
+    rotation_degrees: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,25 @@ class QualityGate:
     CONTRAST_WEIGHT: float = 0.35
     DIMENSION_WEIGHT: float = 0.25
 
+    def __init__(self, use_tesseract: Optional[bool] = None) -> None:
+        """Create the quality gate.
+
+        Args:
+            use_tesseract: If ``True``, run a tesseract OCR pass for document-type
+                detection and OSD-based 90/180/270° deskew. If ``None`` (default),
+                read ``QUALITY_GATE_FAST`` from config — fast mode skips that
+                ~2-3 s pass and lets the orchestrator classify the document type
+                from the engine's own OCR text instead.
+        """
+        if use_tesseract is None:
+            try:
+                from config import get_settings
+
+                use_tesseract = not bool(getattr(get_settings(), "QUALITY_GATE_FAST", True))
+            except Exception:
+                use_tesseract = False
+        self.use_tesseract = use_tesseract
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -138,7 +158,7 @@ class QualityGate:
         h, w = img.shape[:2]
 
         # 1. Orientation detection ---------------------------------------
-        orientation = self._detect_orientation(img)
+        orientation, rotation_degrees = self._detect_orientation(img)
 
         # 2. Sharpness (Laplacian variance) ------------------------------
         sharpness_score = self._compute_sharpness(img)
@@ -149,8 +169,13 @@ class QualityGate:
         # 4. Minimum dimension check -------------------------------------
         dim_score = self._compute_dimension_score(w, h)
 
-        # 5. Document type detection (keyword heuristic) -----------------
-        form_type = self._detect_document_type(img)
+        # 5. Document type — tesseract keyword pass only when explicitly enabled;
+        # otherwise the orchestrator classifies it from the OCR text (faster).
+        form_type = (
+            self._detect_document_type(img)
+            if self.use_tesseract
+            else DocumentType.UNBEKANNT
+        )
 
         # 6. Combine into legibility score (weighted average) ------------
         legibility_score = (
@@ -201,7 +226,41 @@ class QualityGate:
             form_type=form_type,
             is_admissible=is_admissible,
             rejection_reason=rejection_reason,
+            rotation_degrees=rotation_degrees,
         )
+
+    def deskew_to_temp(
+        self, image_path: str, assessment: "QualityAssessment"
+    ) -> tuple[str, Optional[str]]:
+        """Return ``(working_path, temp_path_or_None)`` uprighting the page.
+
+        Rotates by the counter-clockwise correction the gate detected (only
+        set when Tesseract OSD was confident). Writes a temp file and returns
+        its path so the caller can delete it; returns the original path and
+        ``None`` when no rotation is needed or rotation fails.
+        """
+        degrees = int(getattr(assessment, "rotation_degrees", 0)) % 360
+        if degrees == 0:
+            return image_path, None
+        try:
+            import tempfile
+            from PIL import Image
+
+            suffix = os.path.splitext(image_path)[1] or ".png"
+            with Image.open(image_path) as im:
+                # PIL rotates CCW for positive angles; OSD 'rotate' is the CW
+                # offset from upright, so a CCW rotation by that amount restores it.
+                corrected = im.rotate(degrees, expand=True)
+                if corrected.mode not in ("RGB", "L"):
+                    corrected = corrected.convert("RGB")
+                fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+                os.close(fd)
+                corrected.save(tmp_path)
+            logger.info("Auto-oriented image by %d° CCW -> %s", degrees, tmp_path)
+            return tmp_path, tmp_path
+        except Exception as exc:
+            logger.warning("Auto-orientation failed (%s); using original image", exc)
+            return image_path, None
 
     def refuse(self, reason: str) -> RefusalResult:
         """Create a formatted refusal result.
@@ -241,53 +300,38 @@ class QualityGate:
     # Orientation detection
     # ------------------------------------------------------------------
 
-    def _detect_orientation(self, img: np.ndarray) -> str:
-        """Detect image orientation.
+    def _detect_orientation(self, img: np.ndarray) -> tuple[str, int]:
+        """Detect orientation, returning ``(orientation, rotation_degrees)``.
 
-        Strategy (in order of preference):
-
-        1. If ``pytesseract`` is available, use OSD (Orientation and
-           Script Detection).
-        2. Fallback: compare horizontal vs vertical projection profiles.
-           Bureaucratic documents have dominant horizontal text lines.
-        3. If all else fails, return ``"correct"``.
-
-        Returns:
-            One of ``"correct"``, ``"rotated_90"``, ``"rotated_180"``,
-            ``"rotated_270"``.
+        *rotation_degrees* is the counter-clockwise correction to apply
+        (0/90/180/270) and is **only** non-zero when Tesseract OSD is
+        confident.  The projection-profile fallback is display-only and never
+        triggers auto-rotation — acting on a guess can corrupt an already
+        upright page.
         """
-        # Try Tesseract OSD first
-        try:
-            import pytesseract
-            osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
-            angle = int(osd.get("rotate", 0))
-            if angle == 0:
-                return "correct"
-            elif angle == 90:
-                return "rotated_90"
-            elif angle == 180:
-                return "rotated_180"
-            elif angle == 270:
-                return "rotated_270"
-        except Exception:
-            pass  # fall through to heuristic
+        # Tesseract OSD (the only confident rotation signal) — only when enabled.
+        if self.use_tesseract:
+            try:
+                import pytesseract
+                osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+                angle = int(osd.get("rotate", 0)) % 360
+                mapping = {
+                    0: "correct",
+                    90: "rotated_90",
+                    180: "rotated_180",
+                    270: "rotated_270",
+                }
+                if angle in mapping:
+                    return mapping[angle], angle
+            except Exception:
+                pass  # fall through to heuristic
 
-        # Fallback: compare horizontal vs vertical projection variance
-        # Horizontal text → stronger horizontal projection peaks
-        h_proj = np.sum(img, axis=1)
-        v_proj = np.sum(img, axis=0)
-
-        h_var = float(np.var(h_proj))
-        v_var = float(np.var(v_proj))
-
-        if h_var > v_var * 1.5:
-            return "correct"
-        elif v_var > h_var * 1.5:
-            # 90 or 270 — we can't distinguish without OCR, guess 90
-            return "rotated_90"
-        else:
-            # Ambiguous — assume correct
-            return "correct"
+        # Fallback: horizontal vs vertical projection variance (display only).
+        h_var = float(np.var(np.sum(img, axis=1)))
+        v_var = float(np.var(np.sum(img, axis=0)))
+        if v_var > h_var * 1.5:
+            return "rotated_90", 0  # looks rotated, but not confident → no rotate
+        return "correct", 0
 
     # ------------------------------------------------------------------
     # Sharpness (Laplacian variance)
@@ -302,43 +346,65 @@ class QualityGate:
         Returns:
             Float in [0.0, 1.0].
         """
+        img_f = img.astype(np.float64)
         try:
             import cv2
-            laplacian = cv2.Laplacian(img, cv2.CV_64F)
-            variance = float(laplacian.var())
+            variance = float(cv2.Laplacian(img, cv2.CV_64F).var())
         except Exception:
             # Pure NumPy fallback (3x3 Laplacian kernel)
             kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float64)
             try:
                 from scipy import ndimage
-                convolved = ndimage.convolve(img.astype(np.float64), kernel)
+                convolved = ndimage.convolve(img_f, kernel)
             except ImportError:
                 # scipy not available — use pure NumPy sliding window
                 from numpy.lib.stride_tricks import sliding_window_view
-                windows = sliding_window_view(img.astype(np.float64), kernel.shape)
+                windows = sliding_window_view(img_f, kernel.shape)
                 convolved = (windows * kernel).sum(axis=(-2, -1))
             variance = float(convolved.var())
 
-        # Normalise — 500 is a typical threshold for readable text
-        score = min(variance / 500.0, 1.0)
-        return score
+        # Normalise — recalibrated for full-resolution scans.
+        score = min(variance / 800.0, 1.0)
+
+        # Sensor/scan noise also inflates Laplacian variance, so a grainy image
+        # can masquerade as "sharp". Estimate high-frequency noise from the
+        # residual after a light 3x3 blur and damp the score when it dominates.
+        noise = float(np.abs(img_f - self._box_blur3(img_f)).mean())
+        if noise > 18.0:
+            score *= max(0.4, 1.0 - (noise - 18.0) / 60.0)
+        return float(np.clip(score, 0.0, 1.0))
+
+    @staticmethod
+    def _box_blur3(a: np.ndarray) -> np.ndarray:
+        """3x3 mean filter with edge replication (pure NumPy)."""
+        p = np.pad(a, 1, mode="edge")
+        return (
+            p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
+            + p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:]
+            + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]
+        ) / 9.0
 
     # ------------------------------------------------------------------
     # Contrast (Michelson)
     # ------------------------------------------------------------------
 
     def _compute_contrast(self, img: np.ndarray) -> float:
-        """Compute Michelson contrast score.
+        """Robust contrast via the 2nd–98th percentile intensity spread.
+
+        Michelson ``(max-min)/(max+min)`` saturated to ~1.0 for almost any
+        scan — a single near-black and near-white pixel was enough — so it
+        never flagged genuinely low-contrast (faded/washed-out) documents. The
+        percentile spread ignores a handful of outlier pixels and actually
+        tracks readability.
 
         Returns:
             Float in [0.0, 1.0].
         """
-        i_max = float(np.max(img))
-        i_min = float(np.min(img))
-        if i_max + i_min == 0:
-            return 0.0
-        contrast = (i_max - i_min) / (i_max + i_min)
-        return contrast
+        p2 = float(np.percentile(img, 2))
+        p98 = float(np.percentile(img, 98))
+        spread = (p98 - p2) / 255.0
+        # spread >= 0.60 → excellent; <= 0.15 → unreadable.
+        return float(np.clip((spread - 0.15) / (0.60 - 0.15), 0.0, 1.0))
 
     # ------------------------------------------------------------------
     # Dimension score

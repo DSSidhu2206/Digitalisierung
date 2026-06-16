@@ -10,4 +10,4 @@ if [ ! -f "frontend/out/dashboard/index.html" ]; then
 fi
 cd backend
 source ../.venv/bin/activate 2>/dev/null || { echo "No .venv found. Run: bash start.sh"; exit 1; }
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level info
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --log-level info

@@ -38,6 +38,7 @@ from app.api.dependencies import (
     get_audit_logger,
     get_chroma_manager,
     get_pipeline,
+    require_api_key,
     verify_file_size,
     verify_file_type,
 )
@@ -250,6 +251,7 @@ async def submit_correction(
     request: Request,
     body: CorrectionRequest,
     pipeline: ExtractionPipeline = Depends(get_pipeline),
+    _auth: None = Depends(require_api_key),
 ) -> CorrectionResponse:
     """Submit user correction → update ChromaDB learning loop.
 
@@ -307,7 +309,7 @@ async def submit_correction(
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to store correction: {str(exc)}",
+            detail="Failed to store correction (see server logs for details).",
         ) from exc
 
 
@@ -432,6 +434,7 @@ async def get_local_training_status(
 async def start_local_training(
     body: LocalTrainingStartRequest,
     pipeline: ExtractionPipeline = Depends(get_pipeline),
+    _auth: None = Depends(require_api_key),
 ) -> LocalTrainingStatusResponse:
     """Start a resumable local learning chunk for the RVL corpus."""
     training_status = pipeline.local_training.start(
@@ -453,6 +456,7 @@ async def start_local_training(
 )
 async def stop_local_training(
     pipeline: ExtractionPipeline = Depends(get_pipeline),
+    _auth: None = Depends(require_api_key),
 ) -> LocalTrainingStatusResponse:
     """Stop the currently managed local learning process."""
     return LocalTrainingStatusResponse(**pipeline.local_training.stop())

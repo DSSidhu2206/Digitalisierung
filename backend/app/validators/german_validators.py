@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import calendar
 import re
-from datetime import date, datetime, timezone, timezone, timezone
+from datetime import date, datetime, timezone
 from typing import ClassVar, Optional
 
 
@@ -186,7 +186,7 @@ class GermanStreetValidator:
     # Allows: letters (incl. umlauts), digits, spaces, hyphens, periods,
     #         German sharp-s (ß), slash (for "Str./Hauptstr.")
     PATTERN: ClassVar[str] = (
-        r"^[\w\s\-\.ßÄÖÜäöü\/]+$"
+        r"^[A-Za-zÄÖÜäöüß0-9\s\-./]+$"
     )
 
     # Minimum reasonable length for a street name
@@ -239,6 +239,10 @@ class GermanStreetValidator:
 
         # Check allowed characters
         if not re.match(cls.PATTERN, stripped):
+            return False
+
+        # Reject pure-number / symbol noise — a real street name has letters.
+        if not any(ch.isalpha() for ch in stripped):
             return False
 
         return True

@@ -7,7 +7,7 @@ resource management.
 
 Usage::
 
-    uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 Spec: Section 10 — API Layer (Main Application)
 """
@@ -252,14 +252,10 @@ def create_app() -> FastAPI:
     # Include API router with /api/v1 prefix
     app.include_router(router, prefix="/api/v1")
 
-    # Serve uploaded images statically for the Flutter frontend
-    uploads_dir: str = UPLOAD_DIR
-    os.makedirs(uploads_dir, exist_ok=True)
-    app.mount(
-        "/uploads",
-        StaticFiles(directory=uploads_dir),
-        name="uploads",
-    )
+    # NOTE: uploaded files are deliberately NOT served statically. They contain
+    # PII (German registration / tax / ID documents), are deleted immediately
+    # after processing, and the dashboard previews them via client-side blob
+    # URLs — so there is no reason to expose them unauthenticated over HTTP.
 
     if frontend_next_static.is_dir():
         app.mount(
@@ -337,8 +333,8 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "app.main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=settings.HOST,
+        port=settings.PORT,
         reload=settings.DEBUG,
         log_level="info",
     )
