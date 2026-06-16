@@ -26,6 +26,10 @@ If your dataset's input path differs, fix `DATA` in the config cell.
 
     ("code", """import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # pin to ONE T4 (Kaggle gives 2): HF
+                                           # Trainer auto-wraps in DataParallel,
+                                           # which defeats gradient checkpointing
+                                           # and piles memory onto GPU 0 -> OOM
 import json, random
 from pathlib import Path
 import torch
@@ -113,6 +117,7 @@ print("training on", len(train_ds), "samples")"""),
     learning_rate=3e-5,
     fp16=True,
     gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
     logging_steps=50,
     save_strategy="epoch",
     save_total_limit=1,
